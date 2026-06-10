@@ -1,0 +1,38 @@
+[package]
+name = "tcp-sans-io"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Verification-first, sans-I/O, deterministic TCP/IPv4/IPv6 protocol core for safety-critical systems"
+license = "MIT OR Apache-2.0"
+categories = ["network-programming", "no-std", "embedded", "aerospace"]
+keywords = ["tcp", "sans-io", "deterministic", "no-std", "formal-verification"]
+
+# Zero runtime dependencies, zero build dependencies, zero proc macros.
+# The protocol core must be fully auditable and certifiable.
+[dependencies]
+
+[features]
+# Default is pure `#![no_std]`, no allocator: the certifiable configuration.
+default = []
+# `alloc` pulls in the `alloc` crate and adds heap conveniences (e.g. placing
+# the fixed-capacity stack pool on the heap). The protocol core still performs
+# no per-packet allocation.
+alloc = []
+# `std` implies `alloc` and additionally provides `std::error::Error` for
+# `Error` and the TUN host runtime used by the on-the-wire interop tests.
+std = ["alloc"]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -1,0 +1,6 @@
+# Rust build artifacts (crate root and tools/tun-harness)
+target/
+
+# TLC model-checker scratch state
+formal/states/
+formal/*.out

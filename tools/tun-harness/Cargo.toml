@@ -1,0 +1,22 @@
+[package]
+name = "tun-harness"
+version = "0.1.0"
+edition = "2024"
+description = "On-the-wire interop harness: drives tcp-sans-io against the real Linux kernel TCP stack over a TUN device"
+publish = false
+
+# Its own workspace root: decoupled from the parent crate's package-wide
+# `unsafe_code = forbid` lint. This harness needs exactly one `unsafe` block
+# (the TUNSETIFF ioctl); the protocol core it links against remains 100%
+# safe and `#![forbid(unsafe_code)]`.
+[workspace]
+
+[dependencies]
+tcp-sans-io = { path = "../..", features = ["std"] }
+
+[[bin]]
+name = "tun-interop"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
