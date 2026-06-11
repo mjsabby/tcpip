@@ -19,7 +19,9 @@ pub struct SackScoreboard {
 impl SackScoreboard {
     /// Empty scoreboard.
     pub fn new() -> Self {
-        SackScoreboard { ranges: BoundedVec::new() }
+        SackScoreboard {
+            ranges: BoundedVec::new(),
+        }
     }
 
     /// Ingest the SACK blocks of one ACK. Returns true if any *new* range

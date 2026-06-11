@@ -231,9 +231,13 @@ this is the honest current state:
   TIME-WAIT, retransmission under 30 % loss, SACK recovery, window scaling,
   zero-window persist, PMTUD, ICMP echo, fragment reassembly, RFC 5961
   blind-attack mitigation, ISN unpredictability, checksum rejection, and
-  **pool exhaustion**: a SYN flood pins at most `CONNS` slots, excess SYNs
-  are shed with zero amplification (no SYN-ACK, no RST), half-opens expire
-  on the retry budget, and service recovers.
+  **pool exhaustion**: a SYN flood pins at most `CONNS` slots; *once full*,
+  excess SYNs are shed with zero amplification (no SYN-ACK, no RST). The
+  first `CONNS` SYNs each elicit a SYN-ACK + `max_syn_retries` retransmits
+  (≈ 7× by-byte) — the residual reflection inherent to no-SYN-cookies TCP
+  (`D-SYN-1`); martian-source filtering (`S-MARTIAN-1`) ensures the target
+  is never multicast/broadcast. Half-opens expire on the retry budget and
+  service recovers.
 * **Internal invariants (executable).** `Connection::check_invariants`
   (S-INV-1..5) runs in debug builds after every input and every emitted
   segment; the receive buffer and SACK scoreboard self-check too.

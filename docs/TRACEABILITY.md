@@ -242,6 +242,13 @@ believed:
   amplification, expires half-opens on the SYN-ACK retry budget, and
   recovers. All queues are bounded and shed rather than grow
   (`StackStats::{actions_shed, actions_peak}` make this observable).
+- **L-OOO-1 (receive path never wedges, executed).**
+  `fuzz_heavy_reorder_never_wedges_receive_path` drives heavy
+  jitter-induced reordering across 40 seeds and asserts every survivor
+  converges in the clean tail — a connection that lives but never delivers
+  is the DEF-C2 livelock signature.
+- **L-FIN-1 (single-FIN oracle, executed).** Every fuzz run asserts
+  `peer_fin_count ≤ 1` per socket (DEF-M1).
 
 ---
 
@@ -257,6 +264,32 @@ believed:
 - **I-REASM-2** — Any *conflicting* fragment overlap drops the whole
   datagram (mandatory for IPv6 per RFC 5722; applied to IPv4 too). Exact
   duplicates are tolerated. `ip/reasm.rs`.
+- **S-CHALLENGE-1** — The RFC 5961 §10 challenge-ACK budget is keyed-hash
+  jittered per second in `[cap/2, cap]`, and SYN takes the challenge path
+  *regardless* of sequence number (RFC 5961 §4.2). A fixed global cap is the
+  CVE-2016-5696 side channel. `stack.rs` `take_challenge_token`, `input.rs`
+  `on_segment_sync`. Tested by
+  `security_and_edge::challenge_ack_budget_is_jittered_per_second` and
+  `::syn_consumes_challenge_token_regardless_of_seq`.
+- **S-MARTIAN-1** — Datagrams whose source is multicast, broadcast,
+  unspecified, loopback-from-wire, or `src == dst` are silently dropped
+  before any reply path (RFC 1122 §4.2.3.10). The stack cannot be used as a
+  reflector toward such addresses. `types.rs` `is_unicast_source`; `stack.rs`
+  `deliver_tcp`/`queue_echo`. Tested by
+  `security_and_edge::martian_source_addresses_are_dropped`.
+- **S-PORT-1** — Ephemeral source ports are RFC 6056 Algorithm-5
+  double-hashed (SipHash-keyed), restoring ~14 bits of 4-tuple entropy
+  against blind injection. `stack.rs` `alloc_ephemeral`. Tested by
+  `security_and_edge::ephemeral_ports_are_not_sequential`.
+- **S-IPID-1** — The IPv4 identification field is keyed-hashed, denying the
+  idle-scan / cross-peer traffic-volume side channel of a global counter
+  (RFC 7739). `stack.rs` `next_ident`.
+- **S-GEN-1** — `SocketId` and `TimerKey::Reasm` carry generation counters
+  (32-bit / 8-bit) so a stale handle or stale timer for a recycled slot is
+  rejected, never aliased. `types.rs`, `ip/reasm.rs`.
+- **S-TIMEWAIT-1** — RST is ignored in TIME-WAIT (RFC 1337). `input.rs`
+  `on_segment_sync`. Tested by `security_and_edge::time_wait_ignores_rst`.
+- **S-ISN-DEBUG** — `Debug` for the SipHash key is redacted. `tcp/isn.rs`.
 
 ---
 
@@ -303,6 +336,88 @@ to add coverage.
   state set (RFC 9293 §3.10.4). **Regression test:**
   `scenarios::half_close_then_bulk_send_drains_in_last_ack` (now reproduces it
   in-memory, no root required).
+- **DEF-C1 — CVE-2016-5696 challenge-ACK side channel.** A single global
+  `u8` budget refilled to a fixed constant on a fixed boundary let an
+  off-path attacker with one connection of their own count returned
+  challenge ACKs and binary-search a victim connection's `RCV.NXT`. Made
+  worse by SYN-after-seq-check (DEF-M10). **Found by:** adversarial code
+  review (3 of 13 lenses converged on it). **Fix:** keyed-hash jitter the
+  per-second cap; hoist the SYN check above seq-acceptability. **Tests:**
+  `security_and_edge::challenge_ack_budget_is_jittered_per_second`,
+  `::syn_consumes_challenge_token_regardless_of_seq`.
+- **DEF-C2 — receive-path livelock at OOO budget.** With `MAX_OOO_RANGES`
+  disjoint far-offset ranges stored, an *in-order* segment that did not
+  reach the first range overflowed the N-slot merge scratch *before* the
+  absorption check, was refused (`stored: false`), `RCV.NXT` froze, and the
+  peer retransmitted forever — 8 in-window packets, permanent. **Found by:**
+  adversarial code review of `recvbuf.rs`. **Fix:** N+1 merge scratch;
+  enforce the budget *after* absorption; evict the furthest range, never the
+  head. **Tests:** `recvbuf::tests::in_order_data_never_refused_when_ooo_budget_full`,
+  `security_and_edge::ooo_budget_saturation_cannot_wedge_receive_path`;
+  fuzz lane `fuzz_heavy_reorder_never_wedges_receive_path`.
+- **DEF-C3 — SYN unit re-counted after sequence-space wrap.** "Is the SYN
+  outstanding?" was tested positionally (`iss.since(snd_una) < span`). After
+  ~4 GiB of transfer `snd_una` wraps past `iss`, the SYN was re-counted,
+  `data_sent()` under-read by 1, and every subsequent byte was emitted one
+  position early — a silent 1-byte frameshift of the application stream.
+  **Found by:** adversarial code review of the send path. **Fix:** explicit
+  `syn_acked: bool`. **Test:** `conn::tests::syn_unit_is_not_recounted_after_seq_wrap`.
+- **DEF-C4 — zero-window probe accepted by peer wedged both directions.**
+  The probe sent one byte at `SND.NXT` *without* advancing `SND.NXT`. If the
+  peer's window opened in flight and accepted the byte, its ACK of
+  `SND.NXT+1` was rejected at `ack > SND.NXT` *before* the window update —
+  `snd_wnd` stayed 0, and every subsequent peer segment carried the same
+  rejected ACK, wedging the receive path too. **Fix:** advance `SND.NXT` on
+  the first probe; persist (not Rexmit) drives retransmission so an alive
+  zero-window peer is not aborted. **Test:**
+  `conn::tests::zero_window_probe_ack_is_accepted`.
+- **DEF-H1 — silent zero-window peer pinned a slot forever.** Persist had
+  no abort path (RFC 1122 §4.2.2.17 read strictly). A peer that completed
+  the handshake, advertised window 0, and went silent held its slot
+  indefinitely — `CONNS` such peers exhaust the listener. **Fix:**
+  `cfg.max_persist_retries`; an *acknowledging* peer resets the count. **Test:**
+  `security_and_edge::silent_zero_window_peer_is_eventually_aborted`.
+- **DEF-H2 — TIME-WAIT assassination (RFC 1337).** Exact-seq RST was
+  honored in TIME-WAIT; a rebooted peer's reflexive RST destroyed the 2·MSL
+  quarantine. **Fix:** ignore RST in TIME-WAIT. **Test:**
+  `security_and_edge::time_wait_ignores_rst`.
+- **DEF-M1/M2 — FIN re-consumption / `rcv_nxt` overshoot.** A forged FIN at
+  the post-FIN `RCV.NXT` was re-recorded and re-consumed (drifting `RCV.NXT`,
+  duplicate `PeerFin`); injected data past a recorded out-of-order FIN could
+  step `RCV.NXT` past it so the FIN was never consumed. **Fix:** gate FIN
+  recording/consumption on pre-FIN states; clamp `process_text` to
+  `peer_fin`. **Test:** `security_and_edge::fin_is_consumed_at_most_once`;
+  fuzz oracle `peer_fin_count ≤ 1`.
+- **DEF-M6 — 4 KiB call-stack local on the reassembly→deliver path.** The
+  reassembled payload was copied into a `[u8; REASM_BUF_SIZE]` local
+  beneath the deep `deliver → on_segment` chain — thread-stack overflow on
+  ≤ 8 KiB MCU stacks from a single attacker fragment. **Fix:** `Stack`
+  split into `{reasm, core}`; `Reassembler::completed()` borrows the slot
+  buffer in place; `core.deliver(&reasm.completed())` is a disjoint-field
+  borrow with zero copy.
+- **DEF-L13 — IPv6 Routing Header with Segments Left ≠ 0 was accepted.**
+  Now discarded (RFC 8200 §4.4 / RFC 5095). `wire/ipv6.rs::parse`.
+- **DEF-L14 — reassembled IPv6 payload starting with an extension header
+  was dropped.** `walk_payload` re-walks the fragmentable part.
+- **DEF-L17 — `frag.rs` `frag_offset + at as u16` could wrap.**
+  `saturating_add`.
+- **DEF-L18 — `TcpOptionsEmit` could exceed 60 B header cap.** Compile-time
+  `const _: () = assert!(...)` per option group + release-mode `.min()`.
+- **DEF-M7 — ICMPv4 Next-Hop-MTU read as 32 bits (RFC 1191: low 16).**
+  Garbage in the unused field silently discarded a legitimate PMTU signal.
+- **DEF-M8/M9 — Savage et al. 1999 receiver-driven CC bypass.** Unbounded
+  NewReno dup-ACK inflation; per-ACK `mss²/cwnd` CA increment was
+  ACK-division-able. **Fix:** inflation budget = segments-at-entry; RFC 3465
+  ABC for CA. **Tests:** `cc::tests::dupack_inflation_is_bounded_by_flight`,
+  `::ack_division_does_not_accelerate_ca`.
+- **DEF-M11 — stale timer fire trusted as real.** Guarded:
+  `now < desired ⇒ drop`. **Test:** `conn::tests::stale_timer_fire_is_ignored`.
+- **DEF-L2 — reap-time `CancelTimer` shed was never retried.** The
+  generation bumped regardless, orphaning the cancel. **Fix:** defer the
+  reap (slot stays Closed-but-occupied) until cancels drain.
+- **DEF-L5 — head segment retransmitted twice on SACK-recovery entry.**
+  `rexmit_now` and `sack_cursor = snd_una` both fired. **Fix:**
+  `plan_head_rexmit` advances `sack_cursor` past what it sent.
 - **DEF-2 — model type-bound off-by-one (model only, not the code).** The TLA+
   `TypeOK` bounded `SND.UNA` to `0..MaxSeq`, excluding the legitimate
   post-FIN value `MaxSeq+1`. **Found by:** TLC. **Fix:** widen the bound.

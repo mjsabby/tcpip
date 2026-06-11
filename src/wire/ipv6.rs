@@ -79,11 +79,19 @@ pub fn parse(data: &[u8]) -> Result<(Ipv6Header, &[u8]), WireError> {
     for _ in 0..MAX_EXT_HEADERS {
         match next {
             NEXT_HOP_BY_HOP | NEXT_ROUTING | NEXT_DEST_OPTS => {
-                if at + 2 > end {
+                if at + 4 > end {
                     return Err(WireError::BadExtensionHeader);
                 }
                 let ext_len = 8 + data[at + 1] as usize * 8;
                 if at + ext_len > end {
+                    return Err(WireError::BadExtensionHeader);
+                }
+                // RFC 8200 §4.4 / RFC 5095: a Routing Header with non-zero
+                // Segments Left names *us* as an intermediate hop, not the
+                // final destination. We are not a router (D-IPV6-1) and RH0
+                // is deprecated; discard rather than deliver to the upper
+                // layer as if we were the endpoint (DEF-L13).
+                if next == NEXT_ROUTING && data[at + 3] != 0 {
                     return Err(WireError::BadExtensionHeader);
                 }
                 next = data[at];
@@ -104,13 +112,25 @@ pub fn parse(data: &[u8]) -> Result<(Ipv6Header, &[u8]), WireError> {
                 // Fragment data follows; do not walk further (any inner
                 // headers belong to the reassembled datagram).
                 return Ok((
-                    Ipv6Header { src, dst, hop_limit: data[7], proto: data[at - 8], frag },
+                    Ipv6Header {
+                        src,
+                        dst,
+                        hop_limit: data[7],
+                        proto: data[at - 8],
+                        frag,
+                    },
                     &data[at..end],
                 ));
             }
             NEXT_NO_NEXT => {
                 return Ok((
-                    Ipv6Header { src, dst, hop_limit: data[7], proto: next, frag },
+                    Ipv6Header {
+                        src,
+                        dst,
+                        hop_limit: data[7],
+                        proto: next,
+                        frag,
+                    },
                     &data[end..end],
                 ));
             }
@@ -118,10 +138,49 @@ pub fn parse(data: &[u8]) -> Result<(Ipv6Header, &[u8]), WireError> {
                 // Upper-layer protocol (TCP, ICMPv6, or something we will
                 // ignore at the dispatch layer).
                 return Ok((
-                    Ipv6Header { src, dst, hop_limit: data[7], proto: next, frag },
+                    Ipv6Header {
+                        src,
+                        dst,
+                        hop_limit: data[7],
+                        proto: next,
+                        frag,
+                    },
                     &data[at..end],
                 ));
             }
+        }
+    }
+    Err(WireError::BadExtensionHeader)
+}
+
+/// Walk extension headers in a *reassembled* fragmentable part (RFC 8200
+/// §4.5: the fragmentable part may itself begin with Destination-Options or
+/// further extension headers). Returns `(upper_layer_proto, payload)`.
+/// Called from `Stack::deliver` after reassembly when the fragment's `next`
+/// is itself an extension-header type (DEF-L14).
+pub fn walk_payload(mut next: u8, data: &[u8]) -> Result<(u8, &[u8]), WireError> {
+    let end = data.len();
+    let mut at = 0;
+    for _ in 0..MAX_EXT_HEADERS {
+        match next {
+            NEXT_HOP_BY_HOP | NEXT_ROUTING | NEXT_DEST_OPTS => {
+                if at + 4 > end {
+                    return Err(WireError::BadExtensionHeader);
+                }
+                let ext_len = 8 + data[at + 1] as usize * 8;
+                if at + ext_len > end {
+                    return Err(WireError::BadExtensionHeader);
+                }
+                if next == NEXT_ROUTING && data[at + 3] != 0 {
+                    return Err(WireError::BadExtensionHeader);
+                }
+                next = data[at];
+                at += ext_len;
+            }
+            // A fragment header inside a reassembled fragment is invalid.
+            NEXT_FRAGMENT => return Err(WireError::BadExtensionHeader),
+            NEXT_NO_NEXT => return Ok((next, &data[end..end])),
+            _ => return Ok((next, &data[at..end])),
         }
     }
     Err(WireError::BadExtensionHeader)
@@ -223,6 +282,38 @@ mod tests {
         assert!(f.more);
         assert_eq!(f.next, 6);
         assert_eq!(payload, b"01234567");
+    }
+
+    #[test]
+    fn routing_header_with_segments_left_is_rejected() {
+        // DEF-L13: a Routing Header naming us as an intermediate hop
+        // (Segments Left ≠ 0) must be discarded, not delivered as if we
+        // were the final destination.
+        let mut buf = [0u8; 56];
+        emit(&SRC, &DST, NEXT_ROUTING, 64, 8 + 4, &mut buf);
+        buf[40] = super::super::proto::TCP; // next
+        buf[41] = 0; // hdr-ext-len = 0 (8 bytes)
+        buf[42] = 0; // routing type 0 (deprecated, RFC 5095)
+        buf[43] = 3; // segments left
+        assert_eq!(parse(&buf[..52]), Err(WireError::BadExtensionHeader));
+        // Segments Left = 0: we are the final destination → accept.
+        buf[43] = 0;
+        assert!(parse(&buf[..52]).is_ok());
+    }
+
+    #[test]
+    fn walks_reassembled_payload_ext_headers() {
+        // DEF-L14: a reassembled fragmentable part beginning with Dest-Opts
+        // is re-walked to the upper-layer protocol.
+        let mut p = [0u8; 16];
+        p[0] = super::super::proto::TCP; // next after Dest-Opts
+        p[1] = 0; // 8-byte header
+        p[8..12].copy_from_slice(b"tcp!");
+        let (proto, payload) = walk_payload(NEXT_DEST_OPTS, &p[..12]).unwrap();
+        assert_eq!(proto, super::super::proto::TCP);
+        assert_eq!(payload, b"tcp!");
+        // Nested fragment header inside a reassembled payload is rejected.
+        assert!(walk_payload(NEXT_FRAGMENT, &p[..12]).is_err());
     }
 
     #[test]

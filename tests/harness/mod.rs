@@ -169,7 +169,12 @@ pub struct Net {
 impl Net {
     /// Build a v4 network. `seed` drives all impairment decisions.
     pub fn new(model: NetModel, seed: u64) -> Self {
-        Self::with_addrs(IpAddr::v4(10, 0, 0, 1), IpAddr::v4(10, 0, 0, 2), model, seed)
+        Self::with_addrs(
+            IpAddr::v4(10, 0, 0, 1),
+            IpAddr::v4(10, 0, 0, 2),
+            model,
+            seed,
+        )
     }
 
     /// Build a v6 network.
@@ -237,7 +242,14 @@ impl Net {
 
     /// Endpoint of `host` on `port`.
     pub fn endpoint(&self, host: Host, port: u16) -> SocketAddr {
-        SocketAddr::new(if host == Host::A { self.addr_a } else { self.addr_b }, port)
+        SocketAddr::new(
+            if host == Host::A {
+                self.addr_a
+            } else {
+                self.addr_b
+            },
+            port,
+        )
     }
 
     /// Current virtual time.
@@ -277,7 +289,10 @@ impl Net {
             // amount of work; burning all fuel means poll_action will yield
             // actions forever (e.g. an ACK/retransmit generation loop).
             fuel -= 1;
-            assert!(fuel > 0, "poll_action did not quiesce within {DRAIN_FUEL} actions: livelock");
+            assert!(
+                fuel > 0,
+                "poll_action did not quiesce within {DRAIN_FUEL} actions: livelock"
+            );
             match action {
                 Action::None => {}
                 Action::RequestEntropy => {
@@ -308,7 +323,9 @@ impl Net {
     fn launch(&mut self, from: Host, bytes: &[u8]) {
         let mut deliver = self.clock + self.model.delay;
         if self.model.jitter.as_micros() > 0 {
-            deliver += Duration::from_micros(self.rng.below(self.model.jitter.as_micros() as u32 + 1) as u64);
+            deliver += Duration::from_micros(
+                self.rng.below(self.model.jitter.as_micros() as u32 + 1) as u64,
+            );
         }
         // Loss.
         if self.rng.chance_permille(self.model.loss_permille) {
@@ -332,7 +349,12 @@ impl Net {
 
     fn push_wire(&mut self, to: Host, deliver_at: Instant, bytes: Vec<u8>) {
         self.seq += 1;
-        self.wire.push(InFlight { deliver_at, to, bytes, seq: self.seq });
+        self.wire.push(InFlight {
+            deliver_at,
+            to,
+            bytes,
+            seq: self.seq,
+        });
     }
 
     fn arm(&mut self, host: Host, key: TimerKey, fire_at: Instant) {
@@ -343,7 +365,12 @@ impl Net {
                 return;
             }
         }
-        self.timers.push(Timer { fire_at, host, key, live: true });
+        self.timers.push(Timer {
+            fire_at,
+            host,
+            key,
+            live: true,
+        });
     }
 
     fn cancel(&mut self, host: Host, key: TimerKey) {
@@ -358,8 +385,12 @@ impl Net {
     /// and pump. Returns false when nothing is pending.
     pub fn step(&mut self) -> bool {
         let next_wire = self.wire.iter().map(|p| p.deliver_at).min();
-        let next_timer =
-            self.timers.iter().filter(|t| t.live).map(|t| t.fire_at).min();
+        let next_timer = self
+            .timers
+            .iter()
+            .filter(|t| t.live)
+            .map(|t| t.fire_at)
+            .min();
         let next = match (next_wire, next_timer) {
             (None, None) => return false,
             (Some(w), None) => w,
@@ -394,8 +425,10 @@ impl Net {
             .filter(|&i| self.wire[i].deliver_at <= self.clock)
             .collect();
         due_wire.sort_by_key(|&i| (self.wire[i].deliver_at, self.wire[i].seq));
-        let delivered: Vec<(Host, Vec<u8>)> =
-            due_wire.iter().map(|&i| (self.wire[i].to, self.wire[i].bytes.clone())).collect();
+        let delivered: Vec<(Host, Vec<u8>)> = due_wire
+            .iter()
+            .map(|&i| (self.wire[i].to, self.wire[i].bytes.clone()))
+            .collect();
         // Remove delivered (descending index to keep positions valid).
         let mut idxs = due_wire;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
@@ -423,8 +456,12 @@ impl Net {
     /// while the wire is idle), processing any timers that come due.
     pub fn idle(&mut self, d: Duration) {
         let target = self.clock + d;
-        while let Some(next) =
-            self.timers.iter().filter(|t| t.live && t.fire_at <= target).map(|t| t.fire_at).min()
+        while let Some(next) = self
+            .timers
+            .iter()
+            .filter(|t| t.live && t.fire_at <= target)
+            .map(|t| t.fire_at)
+            .min()
         {
             self.clock = next;
             if !self.step() {
@@ -480,7 +517,14 @@ impl Net {
     }
 
     pub fn close(&mut self, host: Host, sock: SocketId) {
-        self.stack(host).close(sock).expect("close");
+        let now = self.clock;
+        self.stack(host).close(now, sock).expect("close");
+        self.maybe_drain(host);
+    }
+
+    pub fn abort(&mut self, host: Host, sock: SocketId) {
+        let now = self.clock;
+        self.stack(host).abort(now, sock).expect("abort");
         self.maybe_drain(host);
     }
 
@@ -515,8 +559,12 @@ impl Net {
     /// wake it") shows up here as desired-without-armed.
     pub fn assert_timer_fidelity(&mut self, host: Host, sock: SocketId) {
         self.drain(host); // quiesce: after this, emitted == desired
-        const KINDS: [TimerKind; 4] =
-            [TimerKind::Rexmit, TimerKind::Persist, TimerKind::DelAck, TimerKind::Wait];
+        const KINDS: [TimerKind; 4] = [
+            TimerKind::Rexmit,
+            TimerKind::Persist,
+            TimerKind::DelAck,
+            TimerKind::Wait,
+        ];
         let desired = self.host(host).timer_deadlines_of(sock);
         for (i, kind) in KINDS.into_iter().enumerate() {
             let key = TimerKey::Conn { sock, kind };
@@ -557,7 +605,10 @@ impl Net {
 
     pub fn accepted_socket(&self, host: Host) -> Option<(SocketId, u16)> {
         self.events.iter().find_map(|c| match c.event {
-            AppEvent::Connected { sock, via_listener: Some(p) } if c.host == host => Some((sock, p)),
+            AppEvent::Connected {
+                sock,
+                via_listener: Some(p),
+            } if c.host == host => Some((sock, p)),
             _ => None,
         })
     }
@@ -573,6 +624,13 @@ impl Net {
         self.events
             .iter()
             .any(|c| c.host == host && c.event == AppEvent::PeerFinReceived { sock })
+    }
+
+    /// Count of `PeerFinReceived` events delivered for a socket. The
+    /// single-FIN oracle: this MUST be ≤ 1 over a connection's lifetime
+    /// regardless of what arrives on the wire (DEF-M1).
+    pub fn peer_fin_count(&self, host: Host, sock: SocketId) -> usize {
+        self.count_events(|c| c.host == host && c.event == AppEvent::PeerFinReceived { sock })
     }
 
     pub fn count_events(&self, pred: impl Fn(&Captured) -> bool) -> usize {
@@ -601,7 +659,10 @@ pub fn establish(net: &mut Net, port: u16) -> (SocketId, SocketId) {
     let client = net.connect(Host::A, server_ep);
     net.run(100);
     let server = net.accepted_socket(Host::B).expect("server accepted").0;
-    assert_eq!(net.state_a(client), Some(tcp_sans_io::tcp::State::Established));
+    assert_eq!(
+        net.state_a(client),
+        Some(tcp_sans_io::tcp::State::Established)
+    );
     (client, server)
 }
 

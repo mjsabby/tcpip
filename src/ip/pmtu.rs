@@ -68,7 +68,12 @@ impl<const N: usize> PmtuCache<N> {
         let candidate = if reported == 0 {
             // RFC 1191 §7: no MTU reported — drop to the next plateau below
             // the current estimate.
-            PLATEAUS.iter().rev().copied().find(|&p| p < current).unwrap_or(floor)
+            PLATEAUS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&p| p < current)
+                .unwrap_or(floor)
         } else {
             reported.min(u16::MAX as u32) as u16
         };
@@ -81,7 +86,11 @@ impl<const N: usize> PmtuCache<N> {
     }
 
     fn insert(&mut self, now: Instant, dst: &IpAddr, mtu: u16) {
-        let entry = Entry { dst: *dst, mtu, expires: now + PMTU_TTL };
+        let entry = Entry {
+            dst: *dst,
+            mtu,
+            expires: now + PMTU_TTL,
+        };
         // Existing entry for dst, else an empty/expired slot, else evict the
         // entry expiring soonest (it is the least valuable to keep).
         let mut victim = 0;

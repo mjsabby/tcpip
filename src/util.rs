@@ -23,7 +23,10 @@ impl<T: Copy + Default, const N: usize> Default for BoundedVec<T, N> {
 impl<T: Copy + Default, const N: usize> BoundedVec<T, N> {
     /// An empty vector.
     pub fn new() -> Self {
-        BoundedVec { items: [T::default(); N], len: 0 }
+        BoundedVec {
+            items: [T::default(); N],
+            len: 0,
+        }
     }
 }
 
@@ -146,7 +149,11 @@ impl<T: Copy + Default, const N: usize> Default for BoundedQueue<T, N> {
 impl<T: Copy + Default, const N: usize> BoundedQueue<T, N> {
     /// An empty queue.
     pub fn new() -> Self {
-        BoundedQueue { items: [T::default(); N], head: 0, len: 0 }
+        BoundedQueue {
+            items: [T::default(); N],
+            head: 0,
+            len: 0,
+        }
     }
 }
 

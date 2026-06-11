@@ -42,8 +42,14 @@ impl Stream {
         // corruption slipped through — a TCP correctness bug.
         for (i, &b) in bytes.iter().enumerate() {
             let pos = start + i;
-            assert!(pos < self.sent.len(), "received more bytes than were sent (pos {pos})");
-            assert_eq!(b, self.sent[pos], "stream byte {pos} mismatched (out-of-order/dup/corrupt)");
+            assert!(
+                pos < self.sent.len(),
+                "received more bytes than were sent (pos {pos})"
+            );
+            assert_eq!(
+                b, self.sent[pos],
+                "stream byte {pos} mismatched (out-of-order/dup/corrupt)"
+            );
         }
         self.received.extend_from_slice(bytes);
     }
@@ -94,7 +100,11 @@ fn run_once_with(
     let Some(server) = net.accepted_socket(Host::B).map(|x| x.0) else {
         // Under extreme loss the handshake may not finish within budget;
         // that is acceptable for liveness (no impairment-free tail yet).
-        return RunOutcome { survived: false, completed: false, peak: peak(&net) };
+        return RunOutcome {
+            survived: false,
+            completed: false,
+            peak: peak(&net),
+        };
     };
 
     let mut rng = Rng::new(seed ^ 0xA5A5_A5A5);
@@ -128,7 +138,9 @@ fn run_once_with(
         }
         if rng.below(100) < 40 {
             let n = 1 + rng.below(800) as usize;
-            let chunk: Vec<u8> = (0..n).map(|i| (b2a.sent.len() + i).wrapping_mul(3) as u8).collect();
+            let chunk: Vec<u8> = (0..n)
+                .map(|i| (b2a.sent.len() + i).wrapping_mul(3) as u8)
+                .collect();
             if let Some(accepted) = net.try_send(Host::B, server, &chunk) {
                 b2a.submit(&chunk[..accepted]);
             }
@@ -159,13 +171,20 @@ fn run_once_with(
         net.pump();
         net.assert_timer_fidelity(Host::A, client);
         net.assert_timer_fidelity(Host::B, server);
-        return RunOutcome { survived: false, completed: false, peak: peak(&net) };
+        return RunOutcome {
+            survived: false,
+            completed: false,
+            peak: peak(&net),
+        };
     }
 
     // Clean tail: impairment stops AND the runtime recovers its drain
     // discipline. From here convergence is mandatory for a live connection.
     net.drain_policy = DrainPolicy::Eager;
-    net.model = NetModel { delay: Duration::from_millis(5), ..Default::default() };
+    net.model = NetModel {
+        delay: Duration::from_millis(5),
+        ..Default::default()
+    };
     for _ in 0..50_000 {
         let progressed = net.step();
         while let Some(n) = net.try_recv(Host::B, server, &mut rbuf).filter(|&n| n > 0) {
@@ -192,16 +211,38 @@ fn run_once_with(
     net.assert_timer_fidelity(Host::A, client);
     net.assert_timer_fidelity(Host::B, server);
 
+    // Single-FIN oracle (DEF-M1): regardless of duplication, reordering, or
+    // a non-compliant runtime, the application sees the peer's FIN at most
+    // once. A second `PeerFin` means RCV.NXT drifted on a re-consumed FIN.
+    assert!(
+        net.peer_fin_count(Host::A, client) <= 1,
+        "seed {seed}: PeerFin delivered {} times",
+        net.peer_fin_count(Host::A, client)
+    );
+    assert!(
+        net.peer_fin_count(Host::B, server) <= 1,
+        "seed {seed}: PeerFin delivered {} times",
+        net.peer_fin_count(Host::B, server)
+    );
+
     // A compliant runtime must never see the stack shed an action: the
     // queue is provably deep enough when drained after every event.
     if policy == DrainPolicy::Eager {
-        assert_eq!(sheds(&net), 0, "actions shed under a compliant runtime (seed {seed})");
+        assert_eq!(
+            sheds(&net),
+            0,
+            "actions shed under a compliant runtime (seed {seed})"
+        );
     }
 
     // Reaching the tail means the connection survived the activity phase;
     // anything that dies during a clean, eagerly-drained tail will show up
     // as survived && !completed — the stall signature callers assert on.
-    RunOutcome { survived: true, completed: a2b.complete() && b2a.complete(), peak: peak(&net) }
+    RunOutcome {
+        survived: true,
+        completed: a2b.complete() && b2a.complete(),
+        peak: peak(&net),
+    }
 }
 
 /// Total actions shed by both hosts (only possible under a drain backlog).
@@ -211,14 +252,44 @@ fn sheds(net: &Net) -> u64 {
 
 /// Deeper of the two hosts' action-queue high-water marks.
 fn peak(net: &Net) -> u16 {
-    net.host(Host::A).stats().actions_peak.max(net.host(Host::B).stats().actions_peak)
+    net.host(Host::A)
+        .stats()
+        .actions_peak
+        .max(net.host(Host::B).stats().actions_peak)
+}
+
+/// L-OOO-1 — adversarial out-of-order lane (DEF-C2): heavy jitter so that
+/// many disjoint segments arrive before the head-of-line one, repeatedly
+/// pushing the OOO budget to its limit. The receive path must never wedge
+/// (every seed converges in the clean tail) and the prefix property holds
+/// throughout.
+#[test]
+fn fuzz_heavy_reorder_never_wedges_receive_path() {
+    for seed in 0..40u64 {
+        let model = NetModel {
+            delay: Duration::from_millis(2),
+            // Jitter ≫ delay so many segments overtake each other.
+            jitter: Duration::from_millis(200),
+            loss_permille: 30,
+            dup_permille: 100,
+            corrupt_permille: 0,
+        };
+        let o = run_once_with(seed, model, DrainPolicy::Eager, 1);
+        assert!(
+            !o.survived || o.completed,
+            "seed {seed}: heavy reorder wedged the receive path (DEF-C2 livelock)"
+        );
+    }
 }
 
 #[test]
 fn fuzz_clean_network_always_completes() {
     // No impairment: every run must complete (pure safety + liveness sanity).
     for seed in 0..40u64 {
-        let model = NetModel { delay: Duration::from_millis(5), ..Default::default() };
+        let model = NetModel {
+            delay: Duration::from_millis(5),
+            ..Default::default()
+        };
         assert!(run_once(seed, model), "clean run {seed} did not complete");
     }
 }
@@ -242,7 +313,10 @@ fn fuzz_lossy_network_completes_after_clean_tail() {
         }
     }
     // Every seed should complete once impairment stops; allow no failures.
-    assert_eq!(completed, 60, "some lossy runs failed to converge after a clean tail");
+    assert_eq!(
+        completed, 60,
+        "some lossy runs failed to converge after a clean tail"
+    );
 }
 
 #[test]
@@ -343,15 +417,18 @@ fn fuzz_lazy_runtime_many_connections_deep_backlog() {
                 .events
                 .iter()
                 .filter_map(|cap| match cap.event {
-                    tcp_sans_io::AppEvent::Connected { sock, via_listener: Some(_) }
-                        if cap.host == Host::B =>
-                    {
-                        Some(sock)
-                    }
+                    tcp_sans_io::AppEvent::Connected {
+                        sock,
+                        via_listener: Some(_),
+                    } if cap.host == Host::B => Some(sock),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(accepted.len(), i + 1, "seed {seed}: pair {i} did not establish");
+            assert_eq!(
+                accepted.len(),
+                i + 1,
+                "seed {seed}: pair {i} did not establish"
+            );
             pairs.push((c, accepted[i]));
         }
         net.drain_policy = DrainPolicy::Lazy { skip_permille: 600 };
@@ -370,8 +447,7 @@ fn fuzz_lazy_runtime_many_connections_deep_backlog() {
                 if rng.below(100) < 60 {
                     let n = 1 + rng.below(1200) as usize;
                     let base = streams[i].sent.len();
-                    let chunk: Vec<u8> =
-                        (0..n).map(|k| ((base + k) ^ (i * 31)) as u8).collect();
+                    let chunk: Vec<u8> = (0..n).map(|k| ((base + k) ^ (i * 31)) as u8).collect();
                     if let Some(accepted) = net.try_send(Host::A, c, &chunk) {
                         streams[i].submit(&chunk[..accepted]);
                     }
@@ -382,9 +458,7 @@ fn fuzz_lazy_runtime_many_connections_deep_backlog() {
             }
             for (i, &(_, s)) in pairs.iter().enumerate() {
                 if rng.below(100) < 70 {
-                    while let Some(n) =
-                        net.try_recv(Host::B, s, &mut rbuf).filter(|&n| n > 0)
-                    {
+                    while let Some(n) = net.try_recv(Host::B, s, &mut rbuf).filter(|&n| n > 0) {
                         streams[i].deliver(&rbuf[..n]);
                     }
                 }
@@ -394,7 +468,10 @@ fn fuzz_lazy_runtime_many_connections_deep_backlog() {
         // Runtime recovers; network goes clean: every surviving stream must
         // converge — anything alive-but-incomplete is a stall.
         net.drain_policy = DrainPolicy::Eager;
-        net.model = NetModel { delay: Duration::from_millis(5), ..Default::default() };
+        net.model = NetModel {
+            delay: Duration::from_millis(5),
+            ..Default::default()
+        };
         net.pump();
         for _ in 0..50_000 {
             let progressed = net.step();
@@ -440,7 +517,10 @@ fn fuzz_lazy_runtime_many_connections_deep_backlog() {
     // shed at this scale (eager lanes assert shed == 0; the shed-retry path
     // is unit-tested). If this assert ever fires, that design property
     // regressed and the queue sizing needs re-deriving.
-    assert!(max_peak < 32, "action queue unexpectedly deep ({max_peak}) — sizing margin eroded");
+    assert!(
+        max_peak < 32,
+        "action queue unexpectedly deep ({max_peak}) — sizing margin eroded"
+    );
 }
 
 #[test]
@@ -461,7 +541,13 @@ fn fuzz_is_deterministic() {
 #[test]
 fn fuzz_v6_clean_completes() {
     for seed in 0..20u64 {
-        let mut net = Net::new_v6(NetModel { delay: Duration::from_millis(5), ..Default::default() }, seed);
+        let mut net = Net::new_v6(
+            NetModel {
+                delay: Duration::from_millis(5),
+                ..Default::default()
+            },
+            seed,
+        );
         net.listen(Host::B, PORT);
         let ep = net.endpoint(Host::B, PORT);
         let client = net.connect(Host::A, ep);

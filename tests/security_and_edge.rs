@@ -6,6 +6,7 @@
 mod harness;
 
 use harness::{Host, Net, NetModel, TcpState, establish};
+use tcp_sans_io::config::MAX_OOO_RANGES;
 use tcp_sans_io::time::{Duration, Instant};
 use tcp_sans_io::wire::checksum::Checksum;
 use tcp_sans_io::wire::tcp::{TcpEmit, TcpFlags, TcpOptionsEmit};
@@ -30,7 +31,9 @@ fn forge_v4(
     window: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let (IpAddr::V4(s), IpAddr::V4(d)) = (src.ip, dst.ip) else { panic!("v4 only") };
+    let (IpAddr::V4(s), IpAddr::V4(d)) = (src.ip, dst.ip) else {
+        panic!("v4 only")
+    };
     let mut buf = vec![0u8; 1500];
     let emit = TcpEmit {
         src_port: src.port,
@@ -41,7 +44,12 @@ fn forge_v4(
         window,
         options: TcpOptionsEmit::default(),
     };
-    let seg_len = emit.emit(&src.ip, &dst.ip, (payload, &[]), &mut buf[ipv4::HEADER_LEN..]);
+    let seg_len = emit.emit(
+        &src.ip,
+        &dst.ip,
+        (payload, &[]),
+        &mut buf[ipv4::HEADER_LEN..],
+    );
     ipv4::Ipv4Emit::datagram(s, d, proto::TCP, 64, 1, false).emit(seg_len, &mut buf);
     buf.truncate(ipv4::HEADER_LEN + seg_len);
     buf
@@ -86,8 +94,15 @@ fn in_window_rst_triggers_challenge_then_legit_rst_closes() {
     net.a.on_datagram(now, &inexact);
     net.pump_public();
     net.run(50);
-    assert_eq!(net.state_a(client), Some(TcpState::Established), "inexact RST → challenge, not close");
-    assert!(net.a.stats().challenges_granted > before, "a challenge ACK was sent");
+    assert_eq!(
+        net.state_a(client),
+        Some(TcpState::Established),
+        "inexact RST → challenge, not close"
+    );
+    assert!(
+        net.a.stats().challenges_granted > before,
+        "a challenge ACK was sent"
+    );
 }
 
 #[test]
@@ -180,7 +195,10 @@ fn zero_window_then_reopen_via_persist() {
     }
     // The receive buffer should now be full → window driven to zero and the
     // sender parked on the persist timer.
-    assert!(net.a_snd_wnd(client) <= 1, "peer advertised (near) zero window");
+    assert!(
+        net.a_snd_wnd(client) <= 1,
+        "peer advertised (near) zero window"
+    );
 
     // Drain the receiver; persist probes elicit a window update and the rest
     // flows.
@@ -197,7 +215,11 @@ fn zero_window_then_reopen_via_persist() {
     }
     net.run(5000);
     received += net.recv_all(Host::B, server).len();
-    assert_eq!(received, payload.len(), "transfer resumed after the window reopened");
+    assert_eq!(
+        received,
+        payload.len(),
+        "transfer resumed after the window reopened"
+    );
 }
 
 #[test]
@@ -215,15 +237,23 @@ fn icmp_echo_request_is_answered() {
         body,
         &mut buf[ipv4::HEADER_LEN..],
     );
-    let IpAddr::V4(s) = net.addr_a else { unreachable!() };
-    let IpAddr::V4(d) = net.addr_b else { unreachable!() };
+    let IpAddr::V4(s) = net.addr_a else {
+        unreachable!()
+    };
+    let IpAddr::V4(d) = net.addr_b else {
+        unreachable!()
+    };
     ipv4::Ipv4Emit::datagram(s, d, proto::ICMP, 64, 1, false).emit(icmp_len, &mut buf);
     buf.truncate(ipv4::HEADER_LEN + icmp_len);
 
     let now = net.now();
     net.b.on_datagram(now, &buf);
     net.pump_public();
-    assert_eq!(net.b.stats().echo_tx, before + 1, "an echo reply was generated");
+    assert_eq!(
+        net.b.stats().echo_tx,
+        before + 1,
+        "an echo reply was generated"
+    );
 }
 
 #[test]
@@ -238,7 +268,9 @@ fn fragmented_ip_datagram_reassembles_into_a_segment() {
     // Build a SYN segment with a payload long enough to split.
     let payload = vec![0u8; 32]; // fragmenting a SYN's options/data region
     let syn = forge_v4(a, b, 1000, 0, TcpFlags::SYN, 4096, &payload);
-    let (IpAddr::V4(s), IpAddr::V4(d)) = (a.ip, b.ip) else { unreachable!() };
+    let (IpAddr::V4(s), IpAddr::V4(d)) = (a.ip, b.ip) else {
+        unreachable!()
+    };
     let tcp_seg = &syn[ipv4::HEADER_LEN..];
 
     // Two fragments at offsets 0 and 24 (first 24 bytes, then the rest).
@@ -262,7 +294,10 @@ fn fragmented_ip_datagram_reassembles_into_a_segment() {
     net.pump_public();
     net.run(50);
     // B should have accepted the reassembled SYN and replied (SYN-RECEIVED).
-    assert!(net.b.stats().segs_rx >= 1, "reassembled segment reached TCP");
+    assert!(
+        net.b.stats().segs_rx >= 1,
+        "reassembled segment reached TCP"
+    );
 }
 
 #[test]
@@ -283,7 +318,10 @@ fn time_wait_absorbs_late_duplicate_and_expires() {
     // After 2*MSL (default MSL 30s → 60s) it is reclaimed.
     net.idle(Duration::from_secs(130));
     assert_eq!(net.state_a(client), None);
-    assert_eq!(net.closed_reason(Host::A, client), Some(CloseReason::Normal));
+    assert_eq!(
+        net.closed_reason(Host::A, client),
+        Some(CloseReason::Normal)
+    );
 }
 
 #[test]
@@ -293,17 +331,323 @@ fn checksum_is_verified_on_ingress() {
     let (client, _server) = establish(&mut net, PORT);
     let a = net.endpoint(Host::A, net.client_port(client));
     let b = net.endpoint(Host::B, PORT);
-    let mut seg = forge_v4(b, a, net.a_rcv_nxt(client), net.a_snd_una(client), TcpFlags::ACK, 100, b"x");
+    let mut seg = forge_v4(
+        b,
+        a,
+        net.a_rcv_nxt(client),
+        net.a_snd_una(client),
+        TcpFlags::ACK,
+        100,
+        b"x",
+    );
     // Corrupt a TCP payload byte without fixing the checksum.
     let last = seg.len() - 1;
     seg[last] ^= 0xff;
     let before = net.a.stats().rx_malformed;
     let now = net.now();
     net.a.on_datagram(now, &seg);
-    assert_eq!(net.a.stats().rx_malformed, before + 1, "bad-checksum segment dropped");
+    assert_eq!(
+        net.a.stats().rx_malformed,
+        before + 1,
+        "bad-checksum segment dropped"
+    );
     assert_eq!(net.state_a(client), Some(TcpState::Established));
     let _ = Checksum::new(); // keep the import meaningful
     let _ = Instant::ZERO;
+}
+
+// ------------------------------------------------------------------
+// Regressions from the adversarial audit (DEF-* in TRACEABILITY.md §8)
+// ------------------------------------------------------------------
+
+/// DEF-C1 / S-CHALLENGE-1: the CVE-2016-5696 side channel relies on the
+/// per-second challenge-ACK budget being a fixed, observable constant. With
+/// keyed jitter, draining the bucket in two adjacent seconds yields
+/// *different* counts (and replays identically given the same entropy seed).
+#[test]
+fn challenge_ack_budget_is_jittered_per_second() {
+    let mut net = clean();
+    let (client, _server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+
+    let mut counts = Vec::new();
+    for _sec in 0..6 {
+        let before = net.a.stats().challenges_granted;
+        let now = net.now();
+        for i in 0..50u32 {
+            let seg = forge_v4(b, a, rcv_nxt.wrapping_add(1 + i), 0, TcpFlags::RST, 0, &[]);
+            net.a.on_datagram(now, &seg);
+        }
+        net.pump_public();
+        counts.push(net.a.stats().challenges_granted - before);
+        net.idle(Duration::from_millis(1100));
+    }
+    // Each second's grant is within [cap/2, cap], and they are not all equal.
+    let cap = net.a.config().challenge_acks_per_sec as u64;
+    assert!(
+        counts.iter().all(|&c| c >= cap / 2 && c <= cap),
+        "{counts:?}"
+    );
+    assert!(
+        !counts.windows(2).all(|w| w[0] == w[1]),
+        "challenge-ACK budget is constant across seconds — CVE-2016-5696 side channel: {counts:?}"
+    );
+}
+
+/// DEF-C2: end-to-end form of the receive-path livelock. Saturating the
+/// out-of-order budget with far-offset 1-byte segments must not stop
+/// in-order data from being delivered.
+#[test]
+fn ooo_budget_saturation_cannot_wedge_receive_path() {
+    let mut net = clean();
+    let (client, server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let snd_una = net.a_snd_una(client);
+    let cap = 16 * 1024u32; // RECV_BUF_SIZE default
+
+    // Attacker injects MAX_OOO_RANGES disjoint 1-byte segments near the top
+    // of A's receive window (with a valid ACK so they pass RFC 5961 §5.2).
+    let now = net.now();
+    for i in 0..MAX_OOO_RANGES as u32 {
+        let seq = rcv_nxt.wrapping_add(cap - 2 - i * 2);
+        let seg = forge_v4(b, a, seq, snd_una, TcpFlags::ACK, 1000, &[0xEE]);
+        net.a.on_datagram(now, &seg);
+    }
+    net.pump_public();
+
+    // Now the legitimate peer sends in-order data. Before the fix, A would
+    // refuse it (merge-scratch overflow), RCV.NXT freezes, and B retransmits
+    // forever. After: A accepts, advances, and delivers to the application.
+    let payload = vec![0xAB; 4096];
+    assert_eq!(net.send(Host::B, server, &payload), payload.len());
+    net.run(500);
+    let got = net.recv_all(Host::A, client);
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "in-order data must be delivered even with the OOO budget saturated"
+    );
+    assert!(got.iter().all(|&b| b == 0xAB));
+}
+
+/// DEF-H2 / RFC 1337: a RST must not destroy TIME-WAIT, even with the exact
+/// sequence number — otherwise a rebooted peer's reflexive RST tears down
+/// the 2·MSL quarantine.
+#[test]
+fn time_wait_ignores_rst() {
+    let mut net = clean();
+    let (client, server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    // Close both sides, stepping only as far as the FIN/ACK exchange so the
+    // Wait timer (60 s out) does not fire.
+    net.close(Host::A, client);
+    for _ in 0..50 {
+        net.step();
+        if net.state_b(server) == Some(TcpState::CloseWait) {
+            break;
+        }
+    }
+    net.close(Host::B, server);
+    for _ in 0..50 {
+        net.step();
+        if net.state_a(client) == Some(TcpState::TimeWait) {
+            break;
+        }
+    }
+    assert_eq!(net.state_a(client), Some(TcpState::TimeWait));
+
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let exact_rst = forge_v4(b, a, rcv_nxt, 0, TcpFlags::RST, 0, &[]);
+    let now = net.now();
+    net.a.on_datagram(now, &exact_rst);
+    net.pump_public();
+    assert_eq!(
+        net.state_a(client),
+        Some(TcpState::TimeWait),
+        "RST in TIME-WAIT must be ignored (RFC 1337)"
+    );
+    // It still expires normally after 2·MSL.
+    net.idle(Duration::from_secs(130));
+    assert_eq!(net.state_a(client), None);
+}
+
+/// DEF-H1: a peer that goes silent after closing its window must not pin a
+/// connection slot forever; the persist budget aborts it.
+#[test]
+fn silent_zero_window_peer_is_eventually_aborted() {
+    let mut net = clean();
+    let (client, _server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let snd_una = net.a_snd_una(client);
+
+    // Queue data, then forge a window-0 ACK from B and stop B from
+    // responding (drop everything on the wire).
+    net.send(Host::A, client, &[1u8; 256]);
+    let zero_wnd = forge_v4(b, a, rcv_nxt, snd_una, TcpFlags::ACK, 0, &[]);
+    let now = net.now();
+    net.a.on_datagram(now, &zero_wnd);
+    net.pump_public();
+    net.model.loss_permille = 1000; // peer is silent
+
+    // Persist backs off to 60 s; budget is 14 → bounded under ~15 minutes.
+    net.idle(Duration::from_secs(60 * 20));
+    assert_eq!(
+        net.closed_reason(Host::A, client),
+        Some(CloseReason::TimedOut),
+        "silent zero-window peer must not pin the slot indefinitely"
+    );
+}
+
+/// S-MARTIAN-1: TCP from a multicast/broadcast/unspecified source is
+/// silently dropped (RFC 1122 §4.2.3.10) — no RST, no SYN-ACK reflection.
+#[test]
+fn martian_source_addresses_are_dropped() {
+    let mut net = clean();
+    net.listen(Host::B, PORT);
+    let b = net.endpoint(Host::B, PORT);
+
+    let martians = [
+        IpAddr::v4(224, 0, 0, 1),       // multicast
+        IpAddr::v4(255, 255, 255, 255), // broadcast
+        IpAddr::v4(0, 0, 0, 0),         // unspecified
+        net.addr_b,                     // LAND (src == dst)
+    ];
+    let tx_before = net.b.stats().tx_datagrams;
+    let rst_before = net.b.stats().rst_tx;
+    let now = net.now();
+    for src in martians {
+        // SYN to listener: must NOT allocate a slot or SYN-ACK.
+        let syn = forge_v4(
+            SocketAddr::new(src, 40000),
+            b,
+            1000,
+            0,
+            TcpFlags::SYN,
+            1000,
+            &[],
+        );
+        net.b.on_datagram(now, &syn);
+        // ACK to closed port: must NOT RST.
+        let ack = forge_v4(
+            SocketAddr::new(src, 40001),
+            SocketAddr::new(net.addr_b, 1),
+            0,
+            1,
+            TcpFlags::ACK,
+            0,
+            &[],
+        );
+        net.b.on_datagram(now, &ack);
+    }
+    net.pump_public();
+    assert_eq!(
+        net.b.stats().tx_datagrams,
+        tx_before,
+        "no reply to a martian source"
+    );
+    assert_eq!(net.b.stats().rst_tx, rst_before);
+    assert_eq!(net.b.stats().rx_martian_src as usize, martians.len() * 2);
+}
+
+/// DEF-M1: a forged FIN at RCV.NXT after the legitimate FIN was already
+/// consumed must not advance RCV.NXT or emit a second `PeerFin`.
+#[test]
+fn fin_is_consumed_at_most_once() {
+    let mut net = clean();
+    let (client, server) = establish(&mut net, PORT);
+    net.close(Host::B, server);
+    net.run(200);
+    assert_eq!(net.state_a(client), Some(TcpState::CloseWait));
+    assert_eq!(net.peer_fin_count(Host::A, client), 1);
+
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let snd_una = net.a_snd_una(client);
+    // Forged FIN at the new RCV.NXT (post-FIN). Before the fix this advanced
+    // RCV.NXT and emitted a second PeerFin; repeated, it drifted RCV.NXT.
+    let now = net.now();
+    for i in 0..5 {
+        let seg = forge_v4(
+            b,
+            a,
+            rcv_nxt.wrapping_add(i),
+            snd_una,
+            TcpFlags::ACK.union(TcpFlags::FIN),
+            1000,
+            &[],
+        );
+        net.a.on_datagram(now, &seg);
+    }
+    net.pump_public();
+    net.run(50);
+    assert_eq!(
+        net.a_rcv_nxt(client),
+        rcv_nxt,
+        "RCV.NXT drifted on forged post-FIN FINs"
+    );
+    assert_eq!(
+        net.peer_fin_count(Host::A, client),
+        1,
+        "PeerFin delivered more than once"
+    );
+}
+
+/// S-PORT-1: ephemeral source ports are not a predictable sequence.
+#[test]
+fn ephemeral_ports_are_not_sequential() {
+    let mut net = clean();
+    let mut ports = Vec::new();
+    for p in 6000..6006u16 {
+        net.listen(Host::B, p);
+        let c = net.connect(Host::A, net.endpoint(Host::B, p));
+        ports.push(net.client_port(c));
+        net.run(50);
+    }
+    let deltas: Vec<i32> = ports
+        .windows(2)
+        .map(|w| w[1] as i32 - w[0] as i32)
+        .collect();
+    assert!(
+        !deltas.iter().all(|&d| d == deltas[0]),
+        "ephemeral ports are a constant-delta sequence (RFC 6056 violated): {ports:?}"
+    );
+}
+
+/// DEF-M10 / S-CHALLENGE-1: a SYN to a synchronized connection consumes a
+/// challenge-ACK token *regardless* of whether its sequence number is in
+/// the window. Without this, in/out-of-window is a perfect oracle.
+#[test]
+fn syn_consumes_challenge_token_regardless_of_seq() {
+    let mut net = clean();
+    let (client, _server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+
+    let granted = |net: &Net| net.a.stats().challenges_granted + net.a.stats().challenges_limited;
+
+    let before = granted(&net);
+    let now = net.now();
+    // Out-of-window SYN.
+    net.a
+        .on_datagram(now, &forge_v4(b, a, 0x4000_0000, 0, TcpFlags::SYN, 0, &[]));
+    // In-window SYN.
+    let rcv_nxt = net.a_rcv_nxt(client);
+    net.a
+        .on_datagram(now, &forge_v4(b, a, rcv_nxt, 0, TcpFlags::SYN, 0, &[]));
+    net.pump_public();
+    assert_eq!(
+        granted(&net) - before,
+        2,
+        "both in- and out-of-window SYNs must take the challenge path"
+    );
 }
 
 #[test]
@@ -336,7 +680,11 @@ fn syn_flood_fills_pool_sheds_silently_and_recovers() {
     let now = net.now();
     net.b.on_datagram(now, &syn9);
     net.pump_public();
-    assert_eq!(net.b.stats().tx_datagrams, tx_full, "shed SYN elicited a reply");
+    assert_eq!(
+        net.b.stats().tx_datagrams,
+        tx_full,
+        "shed SYN elicited a reply"
+    );
     assert_eq!(net.b.stats().rst_tx, rst_before, "shed SYN must not RST");
 
     // Burn the SYN-ACK retransmit budget; the half-opens abort and free
@@ -346,5 +694,9 @@ fn syn_flood_fills_pool_sheds_silently_and_recovers() {
     // Recovery: a real handshake now completes.
     let client = net.connect(Host::A, b);
     net.run(200);
-    assert_eq!(net.state_a(client), Some(TcpState::Established), "pool recovered after flood");
+    assert_eq!(
+        net.state_a(client),
+        Some(TcpState::Established),
+        "pool recovered after flood"
+    );
 }

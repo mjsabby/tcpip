@@ -123,8 +123,10 @@ mod tests {
 
     #[test]
     fn verify_round_trip() {
-        let mut data = [0x45u8, 0x00, 0x00, 0x1c, 0x12, 0x34, 0x40, 0x00, 0x40, 0x06, 0, 0, 10,
-            0, 0, 1, 10, 0, 0, 2];
+        let mut data = [
+            0x45u8, 0x00, 0x00, 0x1c, 0x12, 0x34, 0x40, 0x00, 0x40, 0x06, 0, 0, 10, 0, 0, 1, 10, 0,
+            0, 2,
+        ];
         let cks = over(&data);
         data[10..12].copy_from_slice(&cks.to_be_bytes());
         assert_eq!(over(&data), 0);

@@ -91,6 +91,12 @@ pub struct Config {
     /// Idle timeout in FIN-WAIT-2 with a closed local side, to bound
     /// half-closed orphan lifetime (mirrors common practice).
     pub fin_wait2_timeout: Duration,
+    /// Unanswered zero-window probes before aborting the connection
+    /// (RFC 9293 §3.8.3 R2; 0 = probe indefinitely per a strict reading of
+    /// RFC 1122 §4.2.2.17, which lets a malicious peer pin a slot forever).
+    /// "Unanswered" means the probe byte is never acknowledged; a peer that
+    /// keeps ACKing with window 0 still counts as alive and resets the count.
+    pub max_persist_retries: u8,
     /// Answer ICMP/ICMPv6 echo requests (RFC 1122 §3.2.2.6 MUST).
     pub answer_echo: bool,
 }
@@ -117,6 +123,7 @@ impl Default for Config {
             reassembly_timeout: Duration::from_secs(30),
             challenge_acks_per_sec: 10,
             fin_wait2_timeout: Duration::from_secs(60),
+            max_persist_retries: 14,
             answer_echo: true,
         }
     }

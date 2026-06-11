@@ -78,7 +78,11 @@ fn bulk_transfer_exceeds_window_and_arrives_intact() {
     net.run(5000);
     received.extend_from_slice(&net.recv_all(Host::B, server));
 
-    assert_eq!(offered, payload.len(), "all bytes were accepted for sending");
+    assert_eq!(
+        offered,
+        payload.len(),
+        "all bytes were accepted for sending"
+    );
     assert_eq!(received.len(), payload.len(), "all bytes were received");
     assert_eq!(received, payload, "stream integrity preserved");
 }
@@ -102,9 +106,20 @@ fn graceful_close_four_way() {
     net.run(200);
     // Client (active closer) goes through TIME-WAIT; let it expire.
     net.idle(Duration::from_secs(120));
-    assert_eq!(net.state_a(client), None, "client slot reclaimed after TIME-WAIT");
-    assert_eq!(net.state_b(server), None, "server slot reclaimed after LAST-ACK");
-    assert_eq!(net.closed_reason(Host::B, server), Some(CloseReason::Normal));
+    assert_eq!(
+        net.state_a(client),
+        None,
+        "client slot reclaimed after TIME-WAIT"
+    );
+    assert_eq!(
+        net.state_b(server),
+        None,
+        "server slot reclaimed after LAST-ACK"
+    );
+    assert_eq!(
+        net.closed_reason(Host::B, server),
+        Some(CloseReason::Normal)
+    );
 }
 
 #[test]
@@ -127,11 +142,18 @@ fn half_close_then_bulk_send_drains_in_last_ack() {
             break;
         }
     }
-    assert_eq!(net.state_b(server), Some(TcpState::CloseWait), "server reached CLOSE-WAIT");
+    assert_eq!(
+        net.state_b(server),
+        Some(TcpState::CloseWait),
+        "server reached CLOSE-WAIT"
+    );
     // The client's FIN may or may not be ACKed yet; either way it is
     // half-closed and still able to receive.
     assert!(
-        matches!(net.state_a(client), Some(TcpState::FinWait1 | TcpState::FinWait2)),
+        matches!(
+            net.state_a(client),
+            Some(TcpState::FinWait1 | TcpState::FinWait2)
+        ),
         "client half-closed, still reading: {:?}",
         net.state_a(client)
     );
@@ -157,9 +179,17 @@ fn half_close_then_bulk_send_drains_in_last_ack() {
     net.run(5000);
     received.extend_from_slice(&net.recv_all(Host::A, client));
 
-    assert_eq!(received.len(), payload.len(), "client received every byte despite LAST-ACK close");
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "client received every byte despite LAST-ACK close"
+    );
     assert_eq!(received, payload, "stream intact across the half-close");
-    assert_eq!(net.state_b(server), None, "server reclaimed after LAST-ACK completes");
+    assert_eq!(
+        net.state_b(server),
+        None,
+        "server reclaimed after LAST-ACK completes"
+    );
 }
 
 #[test]
@@ -173,8 +203,14 @@ fn simultaneous_close() {
     net.idle(Duration::from_secs(120));
     assert_eq!(net.state_a(client), None);
     assert_eq!(net.state_b(server), None);
-    assert_eq!(net.closed_reason(Host::A, client), Some(CloseReason::Normal));
-    assert_eq!(net.closed_reason(Host::B, server), Some(CloseReason::Normal));
+    assert_eq!(
+        net.closed_reason(Host::A, client),
+        Some(CloseReason::Normal)
+    );
+    assert_eq!(
+        net.closed_reason(Host::B, server),
+        Some(CloseReason::Normal)
+    );
 }
 
 #[test]
@@ -184,8 +220,14 @@ fn connection_refused_to_closed_port() {
     let server_ep = net.endpoint(Host::B, 9999);
     let client = net.connect(Host::A, server_ep);
     net.run(100);
-    assert_eq!(net.closed_reason(Host::A, client), Some(CloseReason::Refused));
-    assert!(net.b.stats().rst_tx >= 1, "B emitted a RST for the closed port");
+    assert_eq!(
+        net.closed_reason(Host::A, client),
+        Some(CloseReason::Refused)
+    );
+    assert!(
+        net.b.stats().rst_tx >= 1,
+        "B emitted a RST for the closed port"
+    );
 }
 
 #[test]
@@ -208,7 +250,11 @@ fn ipv6_handshake_and_transfer() {
 fn retransmission_recovers_from_total_loss_burst() {
     // 30% loss: the handshake and transfer must still complete via RTO and
     // fast retransmit (liveness under loss, PLAN.md liveness target).
-    let model = NetModel { delay: Duration::from_millis(10), loss_permille: 300, ..Default::default() };
+    let model = NetModel {
+        delay: Duration::from_millis(10),
+        loss_permille: 300,
+        ..Default::default()
+    };
     let mut net = Net::new(model, 0xBADF00D);
     net.listen(Host::B, PORT);
     let server_ep = net.endpoint(Host::B, PORT);
@@ -232,7 +278,10 @@ fn retransmission_recovers_from_total_loss_burst() {
     }
     net.run(20000);
     received.extend_from_slice(&net.recv_all(Host::B, server));
-    assert_eq!(received, payload, "data integrity preserved despite 30% loss");
+    assert_eq!(
+        received, payload,
+        "data integrity preserved despite 30% loss"
+    );
     assert!(net.dropped > 0, "the loss model actually dropped datagrams");
 }
 
@@ -299,13 +348,20 @@ fn corruption_is_rejected_by_checksum() {
     // Corruption strikes both directions (data toward B, ACKs toward A);
     // every corrupted datagram must be rejected by a checksum.
     let rejected = net.a.stats().rx_malformed + net.b.stats().rx_malformed;
-    assert!(rejected > 0, "corrupted datagrams were rejected by checksum");
+    assert!(
+        rejected > 0,
+        "corrupted datagrams were rejected by checksum"
+    );
 }
 
 #[test]
 fn window_scaling_enables_large_in_flight_window() {
     // With a scale factor the advertised window can exceed 64 KiB.
-    let cfg = Config { offer_window_scale: true, recv_window_scale: 7, ..Config::default() };
+    let cfg = Config {
+        offer_window_scale: true,
+        recv_window_scale: 7,
+        ..Config::default()
+    };
     let mut net = clean();
     net.reconfigure(cfg.clone(), cfg);
 
@@ -344,8 +400,16 @@ fn many_connections_concurrently() {
     }
     net.run(500);
     for &c in &clients {
-        assert_eq!(net.state_a(c), Some(TcpState::Established), "all opens established");
+        assert_eq!(
+            net.state_a(c),
+            Some(TcpState::Established),
+            "all opens established"
+        );
     }
-    assert_eq!(net.count_events(|c| matches!(c.event,
-        tcp_sans_io::AppEvent::Connected { .. }) && c.host == Host::B), 8);
+    assert_eq!(
+        net.count_events(
+            |c| matches!(c.event, tcp_sans_io::AppEvent::Connected { .. }) && c.host == Host::B
+        ),
+        8
+    );
 }

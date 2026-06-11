@@ -186,9 +186,18 @@ impl Pd {
             window: seg.window,
             options: opts,
         };
-        let seg_len = emit.emit(&PEER_IP, &STACK_IP, (&seg.payload, &[]), &mut buf[ipv4::HEADER_LEN..]);
-        let IpAddr::V4(s) = PEER_IP else { unreachable!() };
-        let IpAddr::V4(d) = STACK_IP else { unreachable!() };
+        let seg_len = emit.emit(
+            &PEER_IP,
+            &STACK_IP,
+            (&seg.payload, &[]),
+            &mut buf[ipv4::HEADER_LEN..],
+        );
+        let IpAddr::V4(s) = PEER_IP else {
+            unreachable!()
+        };
+        let IpAddr::V4(d) = STACK_IP else {
+            unreachable!()
+        };
         ipv4::Ipv4Emit::datagram(s, d, proto::TCP, 64, 1, false).emit(seg_len, &mut buf);
         let total = ipv4::HEADER_LEN + seg_len;
         self.stack.on_datagram(self.now, &buf[..total]);
@@ -197,12 +206,18 @@ impl Pd {
 
     /// Pop the next emitted segment, or panic with context.
     fn next_seg(&mut self, ctx: &str) -> Seg {
-        self.emitted.pop_front().unwrap_or_else(|| panic!("expected a segment ({ctx}), got none"))
+        self.emitted
+            .pop_front()
+            .unwrap_or_else(|| panic!("expected a segment ({ctx}), got none"))
     }
 
     /// Assert no segment is pending.
     fn expect_silence(&mut self) {
-        assert!(self.emitted.is_empty(), "expected silence, got {:?}", self.emitted);
+        assert!(
+            self.emitted.is_empty(),
+            "expected silence, got {:?}",
+            self.emitted
+        );
     }
 
     fn iss(&self) -> u32 {
@@ -240,7 +255,11 @@ fn core_flags(f: TcpFlags) -> u8 {
 }
 
 fn assert_flags(seg: &Seg, expected: TcpFlags, ctx: &str) {
-    assert_eq!(core_flags(seg.flags), core_flags(expected), "flags mismatch ({ctx}): {seg:?}");
+    assert_eq!(
+        core_flags(seg.flags),
+        core_flags(expected),
+        "flags mismatch ({ctx}): {seg:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,24 +271,41 @@ fn passive_open_handshake_exact() {
     pd.stack.listen(STACK_PORT).unwrap();
 
     // < S seq=1000 win=65535 <mss 1460, wscale 7, sackOK>
-    pd.inject(Inject::new(TcpFlags::SYN, 1000, 0).win(65535).syn_opts(1460, Some(7), true));
+    pd.inject(
+        Inject::new(TcpFlags::SYN, 1000, 0)
+            .win(65535)
+            .syn_opts(1460, Some(7), true),
+    );
 
     // > S. seq=ISS ack=1001 <mss …, wscale …, sackOK>
     let synack = pd.next_seg("SYN-ACK");
     assert_flags(&synack, TcpFlags::SYN.union(TcpFlags::ACK), "syn-ack");
     assert_eq!(synack.ack, 1001, "must ack the peer's SYN (seq+1)");
     assert!(synack.mss.is_some(), "SYN-ACK carries MSS");
-    assert_eq!(synack.wscale, Some(0), "we offered window scale (recv shift 0)");
-    assert!(synack.sack_permitted, "we accept SACK since peer offered it");
+    assert_eq!(
+        synack.wscale,
+        Some(0),
+        "we offered window scale (recv shift 0)"
+    );
+    assert!(
+        synack.sack_permitted,
+        "we accept SACK since peer offered it"
+    );
     // RFC 7323 §2.2: the SYN window is unscaled, so it is the full default
     // receive-buffer capacity (16384).
-    assert_eq!(synack.window, 16384, "SYN-ACK advertises the unscaled recv window");
+    assert_eq!(
+        synack.window, 16384,
+        "SYN-ACK advertises the unscaled recv window"
+    );
     let iss = pd.iss();
 
     // < . ack=ISS+1   → completes the handshake; no segment expected.
     pd.inject(Inject::new(TcpFlags::ACK, 1001, iss.wrapping_add(1)).win(65535));
     pd.expect_silence();
-    assert_eq!(pd.stack.state_of(pd.connected_sock().unwrap()), Some(tcp_sans_io::tcp::State::Established));
+    assert_eq!(
+        pd.stack.state_of(pd.connected_sock().unwrap()),
+        Some(tcp_sans_io::tcp::State::Established)
+    );
 }
 
 /// Active open: connect → SYN (with options) → SYN-ACK → ACK.
@@ -292,9 +328,13 @@ fn active_open_handshake_exact() {
 
     // < S. seq=5000 ack=ISS+1
     pd.inject(
-        Inject::new(TcpFlags::SYN.union(TcpFlags::ACK), 5000, iss.wrapping_add(1))
-            .win(65535)
-            .syn_opts(1460, Some(7), true),
+        Inject::new(
+            TcpFlags::SYN.union(TcpFlags::ACK),
+            5000,
+            iss.wrapping_add(1),
+        )
+        .win(65535)
+        .syn_opts(1460, Some(7), true),
     );
 
     // > . ack=5001  (third leg)
@@ -302,7 +342,10 @@ fn active_open_handshake_exact() {
     assert_flags(&ack, TcpFlags::ACK, "ack");
     assert_eq!(ack.ack, 5001, "acks the peer's SYN");
     assert_eq!(ack.seq, iss.wrapping_add(1));
-    assert_eq!(pd.stack.state_of(sock), Some(tcp_sans_io::tcp::State::Established));
+    assert_eq!(
+        pd.stack.state_of(sock),
+        Some(tcp_sans_io::tcp::State::Established)
+    );
 }
 
 /// Data delivery produces an ACK with the exact cumulative ack number.
@@ -313,8 +356,12 @@ fn data_segment_is_acked_exactly() {
 
     // < P. seq=1001 ack=ISS+1 data=10 bytes
     pd.inject(
-        Inject::new(TcpFlags::ACK.union(TcpFlags::PSH), 1001, iss.wrapping_add(1))
-            .data(b"0123456789"),
+        Inject::new(
+            TcpFlags::ACK.union(TcpFlags::PSH),
+            1001,
+            iss.wrapping_add(1),
+        )
+        .data(b"0123456789"),
     );
     // A single in-order segment is delayed-ACKed (RFC 1122 §4.2.3.2), so no
     // immediate reply; the ACK arrives when the delayed-ACK timer fires.
@@ -335,13 +382,15 @@ fn out_of_order_segment_triggers_sack() {
 
     // Gap: peer's data starts at 1001; inject [1011,1021) leaving [1001,1011)
     // missing.
-    pd.inject(
-        Inject::new(TcpFlags::ACK, 1011, iss.wrapping_add(1)).data(b"AAAAAAAAAA"),
-    );
+    pd.inject(Inject::new(TcpFlags::ACK, 1011, iss.wrapping_add(1)).data(b"AAAAAAAAAA"));
     let dupack = pd.next_seg("dup ack with SACK");
     assert_flags(&dupack, TcpFlags::ACK, "dupack");
     assert_eq!(dupack.ack, 1001, "ack still points at the gap");
-    assert_eq!(dupack.sack_blocks, vec![(1011, 1021)], "SACK reports the out-of-order range");
+    assert_eq!(
+        dupack.sack_blocks,
+        vec![(1011, 1021)],
+        "SACK reports the out-of-order range"
+    );
 }
 
 /// Retransmission: unacked data is resent identically after the RTO, with no
@@ -397,7 +446,11 @@ fn exact_rst_resets_connection() {
     let sock = pd.connected_sock().unwrap();
     // RST at exactly RCV.NXT (1001).
     pd.inject(Inject::new(TcpFlags::RST, 1001, 0).win(65535));
-    assert_eq!(pd.stack.state_of(sock), None, "exact RST closed the connection");
+    assert_eq!(
+        pd.stack.state_of(sock),
+        None,
+        "exact RST closed the connection"
+    );
 }
 
 /// FIN handling: peer FIN is acked and advances our state to CLOSE-WAIT.
@@ -408,11 +461,21 @@ fn peer_fin_acked_exactly() {
     let sock = pd.connected_sock().unwrap();
 
     // < F. seq=1001 ack=ISS+1
-    pd.inject(Inject::new(TcpFlags::FIN.union(TcpFlags::ACK), 1001, iss.wrapping_add(1)));
+    pd.inject(Inject::new(
+        TcpFlags::FIN.union(TcpFlags::ACK),
+        1001,
+        iss.wrapping_add(1),
+    ));
     let ack = pd.next_seg("fin ack");
     assert_flags(&ack, TcpFlags::ACK, "ack");
-    assert_eq!(ack.ack, 1002, "acks the FIN's sequence (RCV.NXT advanced past it)");
-    assert_eq!(pd.stack.state_of(sock), Some(tcp_sans_io::tcp::State::CloseWait));
+    assert_eq!(
+        ack.ack, 1002,
+        "acks the FIN's sequence (RCV.NXT advanced past it)"
+    );
+    assert_eq!(
+        pd.stack.state_of(sock),
+        Some(tcp_sans_io::tcp::State::CloseWait)
+    );
 }
 
 // --- shared setup: a fully established passive connection ---------------
@@ -420,7 +483,11 @@ fn peer_fin_acked_exactly() {
 fn establish_passive() -> Pd {
     let mut pd = Pd::new();
     pd.stack.listen(STACK_PORT).unwrap();
-    pd.inject(Inject::new(TcpFlags::SYN, 1000, 0).win(65535).syn_opts(1460, Some(7), true));
+    pd.inject(
+        Inject::new(TcpFlags::SYN, 1000, 0)
+            .win(65535)
+            .syn_opts(1460, Some(7), true),
+    );
     let _synack = pd.next_seg("syn-ack");
     let iss = pd.iss();
     pd.inject(Inject::new(TcpFlags::ACK, 1001, iss.wrapping_add(1)).win(65535));

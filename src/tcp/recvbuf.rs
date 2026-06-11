@@ -16,6 +16,12 @@
 use crate::config::MAX_OOO_RANGES;
 use crate::util::BoundedVec;
 
+/// Merge scratch holds one more than the persistent budget so an in-order
+/// segment that is disjoint from a full range list still merges and absorbs
+/// instead of being refused (which would livelock the receive path: the head
+/// segment is rejected, ranges never coalesce, peer retransmits forever).
+const MERGE_SCRATCH: usize = MAX_OOO_RANGES + 1;
+
 /// One out-of-order range, offsets relative to the ring start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Range {
@@ -90,7 +96,10 @@ impl<const CAP: usize> RecvBuffer<CAP> {
         let end = off + data.len() as u32;
         debug_assert!(end as usize <= CAP, "caller trims to window");
         if data.is_empty() {
-            return Inserted { advance: 0, stored: true };
+            return Inserted {
+                advance: 0,
+                stored: true,
+            };
         }
 
         // Write the bytes at their position in the ring.
@@ -101,19 +110,28 @@ impl<const CAP: usize> RecvBuffer<CAP> {
 
         // Merge [off, end) into the range list (coalescing overlaps and
         // adjacency), then absorb anything now contiguous with `readable`.
+        // The scratch list holds N+1 so a disjoint insert into a full list
+        // still completes; the budget is enforced *after* absorption so that
+        // in-order data is never refused. Overflow can therefore occur only
+        // for a genuinely out-of-order, disjoint segment — and even then we
+        // evict the highest-offset range (furthest from delivery) rather than
+        // the newest, so the head of the stream always makes progress.
         self.stamp = self.stamp.wrapping_add(1);
-        let mut new = Range { start: off, end, stamp: self.stamp };
-        let mut merged: BoundedVec<Range, MAX_OOO_RANGES> = BoundedVec::new();
+        let mut new = Range {
+            start: off,
+            end,
+            stamp: self.stamp,
+        };
+        let mut merged: BoundedVec<Range, MERGE_SCRATCH> = BoundedVec::new();
         let mut placed = false;
-        let mut overflow = false;
         for &r in self.ranges.iter() {
             if r.end < new.start || new.end < r.start {
                 // Disjoint and non-adjacent.
                 if r.start > new.end && !placed {
-                    overflow |= merged.push(new).is_err();
+                    let _ = merged.push(new);
                     placed = true;
                 }
-                overflow |= merged.push(r).is_err();
+                let _ = merged.push(r);
             } else {
                 // Overlapping or adjacent: coalesce into `new`.
                 new.start = new.start.min(r.start);
@@ -121,26 +139,39 @@ impl<const CAP: usize> RecvBuffer<CAP> {
             }
         }
         if !placed {
-            overflow |= merged.push(new).is_err();
+            let _ = merged.push(new);
         }
-        if overflow {
-            // Out-of-order budget exhausted: drop the new bytes, keep the
-            // previous consistent state (peer retransmits; bounded memory
-            // beats completeness here).
-            return Inserted { advance: 0, stored: false };
-        }
-        self.ranges = merged;
+        // ≤ N old ranges + 1 new = ≤ N+1 entries: the scratch never overflows.
+        debug_assert!(merged.len() <= MERGE_SCRATCH);
 
+        // Absorb anything now contiguous with the readable edge. After this,
+        // every remaining range starts strictly above `readable`.
         let mut advance = 0;
-        if let Some(&first_range) = self.ranges.iter().next()
-            && first_range.start <= self.readable
+        if let Some(&head) = merged.iter().next()
+            && head.start <= self.readable
         {
-            advance = first_range.end - self.readable;
-            self.readable = first_range.end;
-            self.ranges.remove(0);
+            advance = head.end - self.readable;
+            self.readable = head.end;
+            merged.remove(0);
+        }
+
+        // Enforce the persistent budget. If still over (the new segment was
+        // disjoint, out of order, and absorbed nothing), evict the furthest
+        // range — never the head, so a future in-order fill can still bridge.
+        let mut stored = true;
+        if merged.len() > MAX_OOO_RANGES {
+            merged.remove(merged.len() - 1);
+            // The evicted range may be the just-inserted one (if it was the
+            // furthest); either way the peer retransmits what we forgot. We
+            // report `stored: false` so the caller dup-ACKs immediately.
+            stored = false;
+        }
+        self.ranges.clear();
+        for &r in merged.iter() {
+            let _ = self.ranges.push(r);
         }
         self.check_invariants();
-        Inserted { advance, stored: true }
+        Inserted { advance, stored }
     }
 
     /// Copy out up to `out.len()` readable bytes, freeing window space.
@@ -170,13 +201,19 @@ impl<const CAP: usize> RecvBuffer<CAP> {
         for i in 0..self.ranges.len() {
             let _ = order.push(i);
         }
+        let now = self.stamp;
         order.as_mut_slice().sort_unstable_by_key(|&i| {
-            // Newest stamp first.
-            u32::MAX - self.ranges[i].stamp
+            // Newest stamp first. Compare by wrapping distance from the
+            // current stamp so the order is correct across the u32 wrap
+            // (RFC 2018 §4: the first SACK block MUST be the most recent).
+            now.wrapping_sub(self.ranges[i].stamp)
         });
         for &i in order.iter() {
             let r = self.ranges[i];
-            if out.push((r.start - self.readable, r.end - self.readable)).is_err() {
+            if out
+                .push((r.start - self.readable, r.end - self.readable))
+                .is_err()
+            {
                 break;
             }
         }
@@ -206,7 +243,13 @@ mod tests {
     #[test]
     fn in_order_flow() {
         let mut b: RecvBuffer<CAP> = RecvBuffer::new();
-        assert_eq!(b.insert(0, b"hello"), Inserted { advance: 5, stored: true });
+        assert_eq!(
+            b.insert(0, b"hello"),
+            Inserted {
+                advance: 5,
+                stored: true
+            }
+        );
         assert_eq!(b.readable(), 5);
         assert_eq!(b.window(), (CAP - 5) as u32);
         let mut out = [0u8; 8];
@@ -219,18 +262,42 @@ mod tests {
     fn out_of_order_merge_and_sack() {
         let mut b: RecvBuffer<CAP> = RecvBuffer::new();
         // Hole at [0,5); store [5,10) then [12,15).
-        assert_eq!(b.insert(5, b"BBBBB"), Inserted { advance: 0, stored: true });
-        assert_eq!(b.insert(12, b"DDD"), Inserted { advance: 0, stored: true });
+        assert_eq!(
+            b.insert(5, b"BBBBB"),
+            Inserted {
+                advance: 0,
+                stored: true
+            }
+        );
+        assert_eq!(
+            b.insert(12, b"DDD"),
+            Inserted {
+                advance: 0,
+                stored: true
+            }
+        );
         let mut blocks: BoundedVec<(u32, u32), 4> = BoundedVec::new();
         b.sack_ranges(&mut blocks);
         // Most recent first.
         assert_eq!(blocks.as_slice(), &[(12, 15), (5, 10)]);
         // Bridge [10,12): coalesces to [5,15).
-        assert_eq!(b.insert(10, b"CC"), Inserted { advance: 0, stored: true });
+        assert_eq!(
+            b.insert(10, b"CC"),
+            Inserted {
+                advance: 0,
+                stored: true
+            }
+        );
         b.sack_ranges(&mut blocks);
         assert_eq!(blocks.as_slice(), &[(5, 15)]);
         // Fill the head: everything becomes readable.
-        assert_eq!(b.insert(0, b"AAAAA"), Inserted { advance: 15, stored: true });
+        assert_eq!(
+            b.insert(0, b"AAAAA"),
+            Inserted {
+                advance: 15,
+                stored: true
+            }
+        );
         assert_eq!(b.readable(), 15);
         let mut out = [0u8; 15];
         b.read(&mut out);
@@ -254,17 +321,60 @@ mod tests {
     }
 
     #[test]
-    fn ooo_budget_exhaustion_drops_new_bytes() {
+    fn ooo_budget_exhaustion_evicts_furthest_not_head() {
         let mut b: RecvBuffer<CAP> = RecvBuffer::new();
         // MAX_OOO_RANGES disjoint ranges (each separated by a 1-byte hole).
         for i in 0..MAX_OOO_RANGES as u32 {
             assert!(b.insert(1 + i * 3, &[7, 7]).stored);
         }
-        // One more disjoint range cannot be tracked.
+        // One more disjoint range past all of them: it's the furthest, so it
+        // is the one evicted (reported as not stored).
         let r = b.insert(1 + MAX_OOO_RANGES as u32 * 3, &[7, 7]);
         assert!(!r.stored);
-        // But coalescing inserts still work.
+        // A disjoint range *below* the existing ones evicts the old furthest
+        // one instead — the new data nearer the head is kept.
+        let mut b2: RecvBuffer<CAP> = RecvBuffer::new();
+        for i in 0..MAX_OOO_RANGES as u32 {
+            assert!(b2.insert(10 + i * 3, &[7, 7]).stored);
+        }
+        let r = b2.insert(2, &[9]);
+        assert!(!r.stored, "an eviction happened");
+        let mut blocks: BoundedVec<(u32, u32), MAX_OOO_RANGES> = BoundedVec::new();
+        b2.sack_ranges(&mut blocks);
+        assert!(
+            blocks.iter().any(|&(s, _)| s == 2),
+            "the near-head insert was kept"
+        );
+        // Coalescing inserts still work without eviction.
         assert!(b.insert(1, &[7, 7, 7]).stored);
+    }
+
+    /// Regression for the receive-path livelock: with the OOO budget
+    /// saturated by far-offset ranges, an exactly-in-order segment that does
+    /// not reach the first range MUST still advance `readable`. Previously
+    /// the N-slot merge scratch overflowed before the absorption check, so
+    /// the in-order data was refused, RCV.NXT froze, and the peer
+    /// retransmitted forever (DEF-C2).
+    #[test]
+    fn in_order_data_never_refused_when_ooo_budget_full() {
+        let mut b: RecvBuffer<CAP> = RecvBuffer::new();
+        // Fill the budget with 1-byte ranges near the top of the window,
+        // leaving a large gap below them.
+        for i in 0..MAX_OOO_RANGES as u32 {
+            let off = CAP as u32 - 2 - i * 2;
+            assert!(b.insert(off, &[0xEE]).stored);
+        }
+        // In-order data well below every stored range: must advance.
+        let r = b.insert(0, b"hello");
+        assert_eq!(
+            r.advance, 5,
+            "in-order data must advance RCV.NXT even at budget"
+        );
+        assert_eq!(b.readable(), 5);
+        // And again, after the first advance freed nothing (ranges are still
+        // far away): the head keeps moving.
+        let r2 = b.insert(5, b"world");
+        assert_eq!(r2.advance, 5);
     }
 
     #[test]

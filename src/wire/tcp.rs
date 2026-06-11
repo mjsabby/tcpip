@@ -213,6 +213,18 @@ impl TcpOptionsEmit {
     }
 }
 
+// DEF-L18: the data-offset field caps the TCP header at 60 bytes. The
+// disjoint option groups this stack ever emits together stay under that, but
+// a future caller setting all groups at once would overflow it (and in
+// release silently encode a wrong data offset). Prove the bound at compile
+// time so any new option breaks the build instead.
+const _: () = {
+    // SYN-only group: MSS + WScale + SACK-permitted = 12 bytes.
+    assert!(HEADER_LEN + 4 + 4 + 4 <= MAX_HEADER_LEN);
+    // Data group: SACK with 4 blocks = 36 bytes.
+    assert!(HEADER_LEN + 4 + 8 * MAX_SACK_BLOCKS <= MAX_HEADER_LEN);
+};
+
 /// Fields for emitting a TCP segment.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpEmit {
@@ -244,8 +256,11 @@ impl TcpEmit {
         payload: (&[u8], &[u8]),
         buf: &mut [u8],
     ) -> usize {
-        let opt_len = self.options.encoded_len();
-        debug_assert!(opt_len % 4 == 0 && HEADER_LEN + opt_len <= MAX_HEADER_LEN);
+        // The const-assert above proves each option *group* fits; this
+        // release-mode clamp additionally guarantees a hostile combination
+        // cannot wrap the 4-bit data-offset field (DEF-L18).
+        let opt_len = self.options.encoded_len().min(MAX_HEADER_LEN - HEADER_LEN);
+        debug_assert!(opt_len % 4 == 0);
         let header_len = HEADER_LEN + opt_len;
         let total = header_len + payload.0.len() + payload.1.len();
 
@@ -356,11 +371,17 @@ mod tests {
     fn checksum_detects_corruption() {
         let (mut buf, len) = emit_full();
         buf[len - 1] ^= 1;
-        assert_eq!(parse(&buf[..len], &A, &B).unwrap_err(), WireError::BadChecksum);
+        assert_eq!(
+            parse(&buf[..len], &A, &B).unwrap_err(),
+            WireError::BadChecksum
+        );
         // Also wrong pseudo-header (different src ip).
         let (buf, len) = emit_full();
         let c = IpAddr::V4([10, 0, 0, 3]);
-        assert_eq!(parse(&buf[..len], &c, &B).unwrap_err(), WireError::BadChecksum);
+        assert_eq!(
+            parse(&buf[..len], &c, &B).unwrap_err(),
+            WireError::BadChecksum
+        );
     }
 
     #[test]
@@ -393,7 +414,10 @@ mod tests {
             ack: 0,
             flags: TcpFlags::SYN,
             window: 0,
-            options: TcpOptionsEmit { mss: Some(1460), ..Default::default() },
+            options: TcpOptionsEmit {
+                mss: Some(1460),
+                ..Default::default()
+            },
         };
         let mut buf = [0u8; 64];
         let len = seg.emit(&A, &B, (&[], &[]), &mut buf);
@@ -405,7 +429,10 @@ mod tests {
         c.add_bytes(&buf[..len]);
         let cks = c.finish();
         write_u16(&mut buf, 16, cks);
-        assert_eq!(parse(&buf[..len], &A, &B).unwrap_err(), WireError::BadOption);
+        assert_eq!(
+            parse(&buf[..len], &A, &B).unwrap_err(),
+            WireError::BadOption
+        );
     }
 
     #[test]

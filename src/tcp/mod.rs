@@ -49,7 +49,10 @@ impl State {
 
     /// States in which the application may still submit data to send.
     pub fn may_send(self) -> bool {
-        matches!(self, State::SynSent | State::SynReceived | State::Established | State::CloseWait)
+        matches!(
+            self,
+            State::SynSent | State::SynReceived | State::Established | State::CloseWait
+        )
     }
 
     /// States in which data from the peer is still accepted.

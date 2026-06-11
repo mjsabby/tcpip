@@ -111,6 +111,13 @@ pub struct Connection<const SND: usize, const RCV: usize> {
 
     // --- Send sequence space (RFC 9293 §3.3.1) ---
     pub(crate) iss: SeqNr,
+    /// Our SYN has been acknowledged. This is explicit state, *not* derived
+    /// from `iss` vs. `snd_una`: after ~4 GiB of transfer `snd_una` wraps
+    /// past `iss`, and a positional test would mis-count the SYN as
+    /// outstanding again — a 1-byte frameshift of the entire send stream
+    /// (DEF-C3). The FIN cannot suffer the same wrap (`snd_nxt` never
+    /// advances past `fin_seq + 1`), so it stays positional.
+    pub(crate) syn_acked: bool,
     pub(crate) snd_una: SeqNr,
     pub(crate) snd_nxt: SeqNr,
     pub(crate) snd_wnd: u32,
@@ -198,6 +205,7 @@ pub struct Connection<const SND: usize, const RCV: usize> {
     pub(crate) cfg_delayed_ack: Option<Duration>,
     pub(crate) cfg_nagle: bool,
     pub(crate) cfg_fin_wait2_timeout: Duration,
+    pub(crate) cfg_max_persist_retries: u8,
 }
 
 impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
@@ -213,6 +221,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             local,
             remote,
             iss,
+            syn_acked: false,
             snd_una: iss,
             snd_nxt: iss.add(1), // the SYN occupies `iss`
             snd_wnd: 0,
@@ -260,6 +269,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             cfg_delayed_ack: cfg.delayed_ack.then_some(cfg.delayed_ack_timeout),
             cfg_nagle: cfg.nagle,
             cfg_fin_wait2_timeout: cfg.fin_wait2_timeout,
+            cfg_max_persist_retries: cfg.max_persist_retries,
         }
     }
 
@@ -380,7 +390,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// Negotiated options `(peer_mss, snd_scale, rcv_scale, sack)` — diag aid.
     pub fn negotiated(&self) -> (u16, u8, u8, bool) {
-        (self.peer_mss, self.snd_scale, self.rcv_scale, self.sack_enabled)
+        (
+            self.peer_mss,
+            self.snd_scale,
+            self.rcv_scale,
+            self.sack_enabled,
+        )
     }
 
     // ----- Application API (call events) -----
@@ -411,7 +426,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             // Receiver-side SWS avoidance (RFC 9293 §3.8.6.2.2): announce
             // the larger window only once it has grown by a full MSS (or
             // half the buffer); the planner sends the update.
-            let grown = self.recv_buf.window().saturating_sub(self.last_wnd_advertised);
+            let grown = self
+                .recv_buf
+                .window()
+                .saturating_sub(self.last_wnd_advertised);
             let threshold = (self.params.local_mss as u32).min(RCV as u32 / 2);
             if grown >= threshold && self.state.synchronized() {
                 self.set_ack(AckState::Now);
@@ -461,7 +479,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
                 | State::Closing
                 | State::LastAck
         ) {
-            Some(ResetReply { seq: self.snd_nxt, ack: Some(self.rcv_nxt) })
+            Some(ResetReply {
+                seq: self.snd_nxt,
+                ack: Some(self.rcv_nxt),
+            })
         } else {
             None
         };
@@ -473,14 +494,36 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// Handle a virtual-timer expiry.
     pub fn on_timer(&mut self, now: Instant, kind: TimerKind, fx: &mut Effects) {
+        // Stale-fire guard (defense in depth): A-POLL-1 obliges the runtime
+        // to suppress superseded expiries, but a non-compliant runtime that
+        // delivers an old fire after a re-arm would otherwise be trusted —
+        // for Rexmit that means a spurious cwnd collapse and a step toward
+        // `max_data_retries`. If our desired deadline is still in the
+        // future, this fire is stale; drop it. Reconcile re-emits the
+        // StartTimer for the still-desired deadline.
+        if self.timers[kind as usize].is_some_and(|d| now < d) {
+            return;
+        }
         self.timers[kind as usize] = None;
         match kind {
             TimerKind::Rexmit => self.on_rexmit_timer(now, fx),
             TimerKind::Persist => {
-                // RFC 9293 §3.8.6.1; RFC 1122 §4.2.2.17: probing a zero
-                // window MUST continue indefinitely — no abort here.
+                // RFC 9293 §3.8.6.1 / RFC 1122 §4.2.2.17 say probe
+                // "indefinitely as long as the receiving TCP continues to
+                // send acknowledgments". A peer that ACKs the probe (even
+                // with window 0) resets `persist_count` via the window-update
+                // path; reaching the cap means the peer is silent — abort
+                // under RFC 9293 §3.8.3 R2 so a malicious or dead peer
+                // cannot pin a slot forever (DEF-H1). `cfg = 0` opts back
+                // into strict RFC 1122 indefinite probing.
+                if self.cfg_max_persist_retries > 0
+                    && self.persist_count >= self.cfg_max_persist_retries
+                {
+                    self.enter_closed(CloseReason::TimedOut, fx);
+                    return;
+                }
                 self.probe_pending = true;
-                self.persist_count = (self.persist_count + 1).min(8);
+                self.persist_count = self.persist_count.saturating_add(1);
                 self.arm_persist(now);
             }
             TimerKind::DelAck => {
@@ -575,17 +618,18 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     }
 
     /// Count the control bits (SYN, FIN) whose sequence numbers fall in
-    /// `[snd_una, snd_nxt)`. Control bits are identified by their actual
-    /// position, never by a state proxy, so the accounting is correct in
-    /// every state (including Closed with an outstanding FIN).
+    /// `[snd_una, snd_nxt)`.
     fn control_units_outstanding(&self) -> u32 {
         let span = self.snd_nxt.since(self.snd_una);
         let mut n = 0;
-        // SYN occupies `iss`.
-        if self.iss.since(self.snd_una) < span {
+        // SYN occupies `iss`. Tested by explicit state, not position, so the
+        // accounting survives `snd_una` wrapping past `iss` (DEF-C3).
+        if !self.syn_acked && span > 0 {
             n += 1;
         }
-        // FIN occupies `fin_seq`.
+        // FIN occupies `fin_seq`. Positional is safe here: once the FIN is
+        // assigned, `snd_nxt` never advances past `fin_seq + 1`, so the
+        // window cannot wrap back over it.
         if let Some(f) = self.fin_seq
             && f.since(self.snd_una) < span
         {
@@ -597,7 +641,9 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     /// Data bytes occupying sequence space between SND.UNA and SND.NXT
     /// (FlightSize per RFC 5681, excluding SYN/FIN control units).
     pub(crate) fn bytes_in_flight(&self) -> u32 {
-        self.snd_nxt.since(self.snd_una).saturating_sub(self.control_units_outstanding())
+        self.snd_nxt
+            .since(self.snd_una)
+            .saturating_sub(self.control_units_outstanding())
     }
 
     pub(crate) fn fin_in_flight(&self) -> bool {
@@ -660,11 +706,22 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     /// at the end of every input and every planned segment.
     pub(crate) fn update_send_timers(&mut self, now: Instant) {
         let outstanding = self.snd_nxt.since(self.snd_una) > 0;
-        if !outstanding {
+        // Persist runs while the peer's window is closed and we have data to
+        // send. The probe byte itself counts as outstanding once emitted, so
+        // persist must stay armed across that single in-flight byte; it
+        // disarms once the window opens or the buffer truly empties. While
+        // persisting, the probe byte is *not* covered by Rexmit (a peer that
+        // keeps ACKing with window 0 must not march toward
+        // `max_data_retries`); a silent peer is bounded by
+        // `max_persist_retries` instead (DEF-H1).
+        let probing = self.snd_wnd == 0 && self.bytes_in_flight() <= 1 && !self.send_buf.is_empty();
+        if !outstanding || probing {
             self.timers[TimerKind::Rexmit as usize] = None;
-            self.rexmit_count = 0;
+            if !outstanding {
+                self.rexmit_count = 0;
+            }
         }
-        let want_persist = !outstanding && self.snd_wnd == 0 && self.unsent() > 0;
+        let want_persist = probing;
         match (want_persist, self.timers[TimerKind::Persist as usize]) {
             (true, None) => self.arm_persist(now),
             (false, Some(_)) => {
@@ -714,10 +771,164 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             debug_assert!(r.le(self.snd_nxt));
         }
         // FIN bookkeeping consistent with state.
-        if matches!(self.state, State::FinWait1 | State::Closing | State::LastAck) {
+        if matches!(
+            self.state,
+            State::FinWait1 | State::Closing | State::LastAck
+        ) {
             debug_assert!(self.fin_queued);
         }
         // Window scaling bounded (RFC 7323 §2.3).
         debug_assert!(self.snd_scale <= 14 && self.rcv_scale <= 14);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::IpAddr;
+    use crate::wire::tcp::{TcpFlags, TcpHeader, TcpOptions};
+
+    type Conn = Connection<4096, 4096>;
+
+    fn established(iss: u32, irs: u32) -> Conn {
+        let cfg = Config::default();
+        let p = ConnParams {
+            local_mss: 1460,
+            offer_wscale: Some(0),
+            offer_sack: true,
+            pmtu_mss: 1460,
+        };
+        let mut c = Conn::client(
+            &cfg,
+            p,
+            SocketAddr::new(IpAddr::v4(10, 0, 0, 1), 50000),
+            SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80),
+            SeqNr(iss),
+        );
+        // Short-circuit to ESTABLISHED.
+        c.state = State::Established;
+        c.syn_acked = true;
+        c.snd_una = SeqNr(iss.wrapping_add(1));
+        c.snd_nxt = c.snd_una;
+        c.irs = SeqNr(irs);
+        c.rcv_nxt = SeqNr(irs.wrapping_add(1));
+        c.snd_wnd = 65535;
+        c.snd_max_wnd = 65535;
+        c.snd_wl1 = c.irs;
+        c.snd_wl2 = c.snd_una;
+        c.reported = true;
+        c
+    }
+
+    fn ack_seg(seq: u32, ack: u32, wnd: u16, fin: bool) -> (TcpHeader, TcpOptions) {
+        let mut flags = TcpFlags::ACK;
+        if fin {
+            flags = flags.union(TcpFlags::FIN);
+        }
+        (
+            TcpHeader {
+                src_port: 80,
+                dst_port: 50000,
+                seq,
+                ack,
+                flags,
+                window: wnd,
+                header_len: 20,
+            },
+            TcpOptions::default(),
+        )
+    }
+
+    /// DEF-C3: after `snd_una` wraps the 32-bit sequence space past `iss`,
+    /// the SYN must NOT be re-counted as outstanding. Before the fix,
+    /// `control_units_outstanding` tested `iss.since(snd_una) < span` — true
+    /// again once `snd_una` wraps — which made `data_sent()` under-count by 1
+    /// and shifted every subsequent byte one position in sequence space.
+    #[test]
+    fn syn_unit_is_not_recounted_after_seq_wrap() {
+        // Place ISS so wrapping past it needs only a few segments.
+        let iss = 100u32;
+        let mut c = established(iss, 0);
+        // Simulate ~4 GiB of transfer: SND.UNA wraps to just before ISS,
+        // SND.NXT just past it, with one segment of real data in flight.
+        let len = 200u32;
+        assert_eq!(
+            c.send(&std::vec![7u8; len as usize][..]).unwrap(),
+            len as usize
+        );
+        c.snd_una = SeqNr(iss.wrapping_sub(50)); // 50 below iss
+        c.snd_nxt = c.snd_una.add(len); // 150 above iss → iss is inside [una,nxt)
+        // ISS is now inside the in-flight window. With the bug,
+        // control_units_outstanding() = 1 → data_sent() = len - 1.
+        assert_eq!(
+            c.control_units_outstanding(),
+            0,
+            "SYN re-counted as outstanding after snd_una wrapped past iss"
+        );
+        assert_eq!(
+            c.data_sent(),
+            len,
+            "data_sent() off by one — DEF-C3 frameshift"
+        );
+        // And an ACK that lands on `iss` exactly must not subtract a SYN unit.
+        let mut fx = Effects::default();
+        let (h, o) = ack_seg(c.rcv_nxt.0, iss, 65535, false);
+        c.on_segment(Instant::ZERO, &h, &o, &[], &mut fx);
+        // 50 bytes were ACKed (from una=iss-50 to iss); buffer popped 50, not 49.
+        assert_eq!(
+            c.send_buf.len(),
+            (len - 50) as usize,
+            "SYN unit re-subtracted at iss"
+        );
+    }
+
+    /// DEF-C4: the zero-window probe advances SND.NXT, so a peer that opens
+    /// its window and accepts the probe byte ACKs a value we honor instead of
+    /// rejecting at the `ack > SND.NXT` gate (which would wedge both sides).
+    #[test]
+    fn zero_window_probe_ack_is_accepted() {
+        let mut c = established(1000, 2000);
+        c.send(&[0x55; 64]).unwrap();
+        c.snd_wnd = 0;
+        c.update_send_timers(Instant::ZERO);
+        // Persist fires → probe planned.
+        let mut fx = Effects::default();
+        c.on_timer(Instant::from_secs(2), TimerKind::Persist, &mut fx);
+        let plan = c.next_segment(Instant::from_secs(2)).expect("probe");
+        assert_eq!(plan.payload_len, 1);
+        let probe_end = plan.seq.add(1);
+        assert_eq!(c.snd_nxt, probe_end, "probe must advance SND.NXT (DEF-C4)");
+        // Peer's window opened: it accepted the byte and ACKs `probe_end`
+        // with a non-zero window. This must be honored, not dropped.
+        let (h, o) = ack_seg(c.rcv_nxt.0, probe_end.0, 4096, false);
+        let una_before = c.snd_una;
+        c.on_segment(Instant::from_secs(2), &h, &o, &[], &mut fx);
+        assert_eq!(
+            c.snd_una, probe_end,
+            "probe-byte ACK rejected — both sides would wedge"
+        );
+        assert_ne!(c.snd_una, una_before);
+        assert_eq!(c.snd_wnd, 4096, "window update from the probe-ACK was lost");
+    }
+
+    /// DEF-M11: a stale timer fire (delivered before the desired deadline)
+    /// is dropped, not acted on as a real expiry.
+    #[test]
+    fn stale_timer_fire_is_ignored() {
+        let mut c = established(1000, 2000);
+        c.send(&[0u8; 100]).unwrap();
+        c.snd_nxt = c.snd_una.add(100);
+        let now = Instant::from_secs(10);
+        c.timers[TimerKind::Rexmit as usize] = Some(now + Duration::from_secs(5));
+        let cwnd_before = c.cc.cwnd;
+        let mut fx = Effects::default();
+        // Fire arrives at `now`, but the desired deadline is `now + 5 s`.
+        c.on_timer(now, TimerKind::Rexmit, &mut fx);
+        assert_eq!(c.cc.cwnd, cwnd_before, "stale Rexmit collapsed cwnd");
+        assert_eq!(c.rexmit_count, 0, "stale Rexmit consumed a retry");
+        assert!(
+            c.timers[TimerKind::Rexmit as usize].is_some(),
+            "stale fire cleared the deadline"
+        );
     }
 }
