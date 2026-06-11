@@ -18,5 +18,10 @@ tcp-sans-io = { path = "../..", features = ["std"] }
 name = "tun-interop"
 path = "src/main.rs"
 
+# Worked example: fetch http://www.bing.com/ through the stack (see fetch.sh).
+[[bin]]
+name = "fetch"
+path = "src/bin/fetch.rs"
+
 [profile.release]
 opt-level = 2

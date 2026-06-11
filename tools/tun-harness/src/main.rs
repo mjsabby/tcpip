@@ -16,10 +16,8 @@
 //!
 //! Exit code 0 on success; non-zero with a diagnostic on failure.
 
-mod runtime;
-mod tun;
-
-use runtime::TunRuntime;
+use tun_harness::runtime::TunRuntime;
+use tun_harness::tun::Tun;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -28,7 +26,6 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tcp_sans_io::config::Config;
 use tcp_sans_io::{AppEvent, IpAddr, SocketAddr, SocketId, Stack};
-use tun::Tun;
 
 const IFNAME: &str = "tcptun0";
 const STACK_IP: [u8; 4] = [10, 9, 0, 2]; // our stack's address

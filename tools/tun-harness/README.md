@@ -25,6 +25,18 @@ stack at `10.9.0.2`), and runs two scenarios:
 Exit code 0 and `ALL INTEROP SCENARIOS PASSED` on success. The interface is
 torn down automatically when the process exits.
 
+## Worked example: fetch a web page
+
+```sh
+sudo ./fetch.sh                # GET http://www.bing.com/
+sudo ./fetch.sh example.com    # any other host
+```
+
+[`src/bin/fetch.rs`](src/bin/fetch.rs) downloads a page from the public
+Internet with the stack doing all of the TCP; the kernel only routes IP
+datagrams (`fetch.sh` enables forwarding + NAT for the stack's `10.99.0.0/24`
+subnet and removes the rules on exit) and resolves the host name.
+
 ## What it demonstrates
 
 * The sans-I/O core embedded in a **real** std runtime (`src/runtime.rs`):
