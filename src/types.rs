@@ -42,6 +42,29 @@ impl IpAddr {
     pub const fn same_family(&self, other: &IpAddr) -> bool {
         self.is_v4() == other.is_v4()
     }
+
+    /// True if this is a unicast address valid as the *source* of a datagram
+    /// the stack should respond to. Rejects multicast, broadcast, the
+    /// unspecified address, and (defensively) loopback arriving from the
+    /// wire. RFC 1122 §4.2.3.10: a host MUST NOT respond to TCP segments
+    /// addressed from a broadcast or multicast source; we extend this to all
+    /// stack-generated replies (RST, SYN-ACK, echo) so the stack cannot be
+    /// used as a reflector toward such addresses (S-MARTIAN-1).
+    pub fn is_unicast_source(&self) -> bool {
+        match self {
+            IpAddr::V4(b) => {
+                b[0] != 0                     // 0.0.0.0/8 ("this network")
+                    && b[0] != 127            // loopback from wire
+                    && b[0] < 224             // 224.0.0.0/4 multicast, 240/4 reserved
+                    && *b != [255, 255, 255, 255] // limited broadcast
+            }
+            IpAddr::V6(b) => {
+                *b != [0; 16]                 // ::
+                    && b[0] != 0xff           // ff00::/8 multicast
+                    && !(b[0] == 0 && b[15] == 1 && b[1..15] == [0; 14]) // ::1
+            }
+        }
+    }
 }
 
 impl Default for IpAddr {
@@ -69,11 +92,14 @@ impl SocketAddr {
 /// Opaque handle to a connection slot.
 ///
 /// Contains a generation counter so a stale handle to a recycled slot is
-/// detected instead of aliasing a new connection (ABA safety).
+/// detected instead of aliasing a new connection (ABA safety). The counter
+/// is 32 bits: at one slot reuse per millisecond it takes ~50 days to wrap,
+/// versus ~1 minute for a 16-bit counter — placing ABA collisions outside
+/// any realistic stale-handle or stale-timer lifetime (S-GEN-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SocketId {
     pub(crate) index: u8,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
 }
 
 /// Per-connection virtual timers.
@@ -107,6 +133,10 @@ pub enum TimerKey {
     Reasm {
         /// Slot index within the reassembler.
         slot: u8,
+        /// Slot generation. Like [`SocketId::generation`], this lets the
+        /// stack detect a stale fire for a recycled slot instead of evicting
+        /// the wrong datagram (S-GEN-1).
+        generation: u8,
     },
 }
 
@@ -276,5 +306,22 @@ mod tests {
         let b = IpAddr::v6([0xfc00, 0, 0, 0, 0, 0, 0, 1]);
         assert!(a.is_v4() && !b.is_v4());
         assert!(!a.same_family(&b));
+    }
+
+    #[test]
+    fn unicast_source_filter() {
+        // Valid unicast sources.
+        assert!(IpAddr::v4(10, 0, 0, 1).is_unicast_source());
+        assert!(IpAddr::v4(223, 255, 255, 255).is_unicast_source());
+        assert!(IpAddr::v6([0xfc00, 0, 0, 0, 0, 0, 0, 1]).is_unicast_source());
+        // Martians.
+        assert!(!IpAddr::v4(0, 0, 0, 0).is_unicast_source());
+        assert!(!IpAddr::v4(127, 0, 0, 1).is_unicast_source());
+        assert!(!IpAddr::v4(224, 0, 0, 1).is_unicast_source()); // multicast
+        assert!(!IpAddr::v4(255, 255, 255, 255).is_unicast_source()); // broadcast
+        assert!(!IpAddr::v4(240, 0, 0, 1).is_unicast_source()); // reserved
+        assert!(!IpAddr::v6([0; 8]).is_unicast_source()); // ::
+        assert!(!IpAddr::v6([0, 0, 0, 0, 0, 0, 0, 1]).is_unicast_source()); // ::1
+        assert!(!IpAddr::v6([0xff02, 0, 0, 0, 0, 0, 0, 1]).is_unicast_source()); // multicast
     }
 }

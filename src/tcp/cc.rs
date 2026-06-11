@@ -20,13 +20,30 @@ pub struct CongestionControl {
     pub ssthresh: u32,
     /// Sender MSS in bytes (tracks effective MSS, e.g. after PMTU drops).
     mss: u32,
+    /// RFC 3465 (ABC) byte-counting accumulator for congestion avoidance:
+    /// add one MSS to `cwnd` only after a full `cwnd`'s worth of bytes has
+    /// been acknowledged. Without this, splitting one segment into N
+    /// micro-ACKs grows `cwnd` N× faster (Savage et al. 1999, DEF-M9).
+    ca_bytes_acked: u32,
+    /// Remaining MSS-units of NewReno window inflation this recovery
+    /// episode may grant. Unbounded inflation lets a malicious receiver
+    /// stream dup-ACKs to blow `cwnd` to `CWND_MAX` (Savage et al. §4.2,
+    /// DEF-M8); the cap is the segments-outstanding at recovery entry.
+    inflate_budget: u32,
 }
 
 impl CongestionControl {
     /// Initial state: IW per RFC 3390 (as referenced by RFC 5681 §3.1),
     /// ssthresh effectively unbounded.
     pub fn new(mss: u32) -> Self {
-        CongestionControl { cwnd: Self::initial_window(mss), ssthresh: CWND_MAX, mss }
+        let mss = mss.clamp(1, u16::MAX as u32);
+        CongestionControl {
+            cwnd: Self::initial_window(mss),
+            ssthresh: CWND_MAX,
+            mss,
+            ca_bytes_acked: 0,
+            inflate_budget: 0,
+        }
     }
 
     /// RFC 3390: IW = min(4*MSS, max(2*MSS, 4380 bytes)).
@@ -45,10 +62,15 @@ impl CongestionControl {
             // RFC 5681 §3.1: cwnd += min(N, SMSS) per ACK.
             self.cwnd = (self.cwnd + acked.min(self.mss)).min(CWND_MAX);
         } else {
-            // Congestion avoidance, RFC 5681 §3.1 eq. (3):
-            // cwnd += max(1, SMSS*SMSS / cwnd) per ACK.
-            let inc = (self.mss * self.mss / self.cwnd.max(1)).max(1);
-            self.cwnd = (self.cwnd + inc).min(CWND_MAX);
+            // Congestion avoidance, RFC 3465 (ABC): accumulate bytes
+            // acknowledged and grow `cwnd` by one MSS per `cwnd` bytes
+            // acked. Unlike per-ACK `mss²/cwnd`, this is immune to
+            // ACK-division (DEF-M9).
+            self.ca_bytes_acked = self.ca_bytes_acked.saturating_add(acked);
+            if self.ca_bytes_acked >= self.cwnd {
+                self.ca_bytes_acked -= self.cwnd;
+                self.cwnd = (self.cwnd + self.mss).min(CWND_MAX);
+            }
         }
     }
 
@@ -64,6 +86,10 @@ impl CongestionControl {
     pub fn enter_fast_recovery(&mut self, flight: u32) {
         self.ssthresh = (flight / 2).max(2 * self.mss);
         self.cwnd = self.ssthresh + 3 * self.mss;
+        // Further inflation is bounded by the segments that were actually
+        // in flight: each legitimate dup-ACK reflects one such segment
+        // leaving the network (DEF-M8).
+        self.inflate_budget = (flight / self.mss.max(1)).saturating_sub(3);
     }
 
     /// Enter SACK-based recovery (RFC 6675 §5): halve; transmission is then
@@ -74,9 +100,13 @@ impl CongestionControl {
     }
 
     /// An additional duplicate ACK during NewReno recovery
-    /// (RFC 5681 §3.2 step 4): inflate by one SMSS.
+    /// (RFC 5681 §3.2 step 4): inflate by one SMSS, up to the per-episode
+    /// budget set at recovery entry.
     pub fn inflate(&mut self) {
-        self.cwnd = (self.cwnd + self.mss).min(CWND_MAX);
+        if self.inflate_budget > 0 {
+            self.inflate_budget -= 1;
+            self.cwnd = (self.cwnd + self.mss).min(CWND_MAX);
+        }
     }
 
     /// Partial ACK during NewReno recovery (RFC 6582 §3.2 step 5): deflate
@@ -89,11 +119,13 @@ impl CongestionControl {
     /// to ssthresh.
     pub fn exit_recovery(&mut self) {
         self.cwnd = self.ssthresh.max(self.mss);
+        self.inflate_budget = 0;
+        self.ca_bytes_acked = 0;
     }
 
     /// Effective MSS changed (PMTU reduction or peer MSS learned).
     pub fn set_mss(&mut self, mss: u32) {
-        self.mss = mss.max(1);
+        self.mss = mss.clamp(1, u16::MAX as u32);
         self.cwnd = self.cwnd.max(self.mss);
     }
 }
@@ -128,10 +160,42 @@ mod tests {
         let mut cc = CongestionControl::new(MSS);
         cc.ssthresh = cc.cwnd; // force CA
         let before = cc.cwnd;
-        cc.on_new_ack(MSS);
-        let inc = cc.cwnd - before;
-        assert!(inc >= 1 && inc <= MSS * MSS / before + 1, "inc={inc}");
+        // ABC: a full cwnd of bytes acked → one MSS added.
+        cc.on_new_ack(before);
+        assert_eq!(cc.cwnd, before + MSS);
         assert!(!cc.in_slow_start());
+    }
+
+    /// DEF-M9: splitting one MSS-sized segment into byte-ACKs must not grow
+    /// cwnd faster than one cumulative ACK would.
+    #[test]
+    fn ack_division_does_not_accelerate_ca() {
+        let mut a = CongestionControl::new(MSS);
+        let mut b = CongestionControl::new(MSS);
+        a.ssthresh = a.cwnd;
+        b.ssthresh = b.cwnd;
+        let cwnd0 = a.cwnd;
+        // One window's worth of data, ACKed as one chunk vs. as bytes.
+        a.on_new_ack(cwnd0);
+        for _ in 0..cwnd0 {
+            b.on_new_ack(1);
+        }
+        assert_eq!(a.cwnd, b.cwnd, "ACK division must not accelerate CA growth");
+    }
+
+    /// DEF-M8: a flood of dup-ACKs cannot inflate cwnd past what
+    /// segments-outstanding-at-entry would justify.
+    #[test]
+    fn dupack_inflation_is_bounded_by_flight() {
+        let mut cc = CongestionControl::new(MSS);
+        cc.cwnd = 16 * MSS;
+        cc.enter_fast_recovery(16 * MSS);
+        let after_entry = cc.cwnd; // ssthresh + 3*MSS
+        for _ in 0..10_000 {
+            cc.inflate();
+        }
+        // 16 segments in flight, 3 already accounted at entry → ≤ 13 more.
+        assert!(cc.cwnd <= after_entry + 13 * MSS);
     }
 
     #[test]
@@ -155,6 +219,7 @@ mod tests {
         cc.enter_fast_recovery(16 * MSS);
         assert_eq!(cc.ssthresh, 8 * MSS);
         assert_eq!(cc.cwnd, 11 * MSS);
+        assert_eq!(cc.inflate_budget, 13);
         cc.inflate();
         assert_eq!(cc.cwnd, 12 * MSS);
         cc.on_partial_ack(4 * MSS);

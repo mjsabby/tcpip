@@ -25,7 +25,13 @@ pub struct RttEstimator {
 impl RttEstimator {
     /// New estimator with the configured initial RTO and clamps.
     pub fn new(initial: Duration, rto_min: Duration, rto_max: Duration) -> Self {
-        RttEstimator { srtt: None, rttvar: Duration::ZERO, rto: initial, rto_min, rto_max }
+        RttEstimator {
+            srtt: None,
+            rttvar: Duration::ZERO,
+            rto: initial,
+            rto_min,
+            rto_max,
+        }
     }
 
     /// Current retransmission timeout.
@@ -75,7 +81,11 @@ mod tests {
     use super::*;
 
     fn est() -> RttEstimator {
-        RttEstimator::new(Duration::from_secs(1), Duration::from_secs(1), Duration::from_secs(60))
+        RttEstimator::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
     }
 
     #[test]

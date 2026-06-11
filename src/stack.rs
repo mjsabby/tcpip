@@ -17,14 +17,14 @@
 
 use crate::config::{
     ACTION_QUEUE_SIZE, CTL_QUEUE_SIZE, Config, ECHO_BUF_SIZE, MAX_LISTENERS, PMTU_CACHE_SIZE,
-    REASM_BUF_SIZE, REASM_SLOTS, RECV_BUF_SIZE, SEND_BUF_SIZE,
+    REASM_SLOTS, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 use crate::ip::pmtu::PmtuCache;
 use crate::ip::reasm::{ReasmResult, Reassembler};
 use crate::ip::{IPV4_MIN_PMTU, IPV6_MIN_PMTU, ReasmKey};
 use crate::tcp::State;
 use crate::tcp::conn::{ConnEvent, ConnParams, Connection, Effects, ResetReply, SegmentPlan};
-use crate::tcp::isn::IsnGenerator;
+use crate::tcp::isn::{IsnGenerator, domain};
 use crate::tcp::seq::SeqNr;
 use crate::time::{Duration, Instant};
 use crate::types::{
@@ -80,6 +80,9 @@ pub struct StackStats {
     pub challenges_limited: u64,
     /// Echo replies sent.
     pub echo_tx: u64,
+    /// Datagrams dropped because the source address is non-unicast (martian:
+    /// multicast/broadcast/unspecified/loopback). See S-MARTIAN-1.
+    pub rx_martian_src: u64,
     /// Actions dropped because the action queue was full (only possible
     /// under an `A-POLL-1` drain backlog). Shed timer actions are re-issued
     /// by the next reconcile; shed app events are not — recover from state
@@ -104,18 +107,31 @@ pub struct StackStats {
 /// // A constrained node: 4 connections, 4 KiB each way.
 /// let stack: Stack<4, 4096, 4096> = Stack::new(Config::with_addr(IpAddr::v4(10,0,0,1)));
 /// ```
+///
+/// The struct is split into the IP reassembler and `core` (everything else)
+/// so a reassembled payload can be borrowed from `reasm` while
+/// `core.deliver(...)` mutates the rest — a disjoint-field borrow that
+/// removes the previous [`REASM_BUF_SIZE`]-byte copy-out on the call stack
+/// (DEF-M6).
 pub struct Stack<
     const CONNS: usize = 8,
     const SND: usize = SEND_BUF_SIZE,
     const RCV: usize = RECV_BUF_SIZE,
 > {
+    reasm: Reassembler,
+    emitted_reasm_timers: [Option<Instant>; REASM_SLOTS],
+    core: StackCore<CONNS, SND, RCV>,
+}
+
+/// Everything in [`Stack`] except the reassembler — the part `deliver`
+/// touches. See the note on [`Stack`] for why the split exists (DEF-M6).
+struct StackCore<const CONNS: usize, const SND: usize, const RCV: usize> {
     cfg: Config,
     conns: [Option<Connection<SND, RCV>>; CONNS],
-    generations: [u16; CONNS],
+    generations: [u32; CONNS],
     listeners: BoundedVec<u16, MAX_LISTENERS>,
     isn: IsnGenerator,
     entropy_request_pending: bool,
-    reasm: Reassembler,
     pmtu: PmtuCache<PMTU_CACHE_SIZE>,
     actions: BoundedQueue<Action, ACTION_QUEUE_SIZE>,
     ctl: BoundedQueue<CtlSegment, CTL_QUEUE_SIZE>,
@@ -123,7 +139,6 @@ pub struct Stack<
     echo_buf: [u8; ECHO_BUF_SIZE],
     /// Timer state as last told to the runtime, per conn slot and kind.
     emitted_conn_timers: [[Option<Instant>; 4]; CONNS],
-    emitted_reasm_timers: [Option<Instant>; REASM_SLOTS],
     /// RFC 5961 §10 challenge-ACK budget.
     challenge_tokens: u8,
     challenge_refill_at: Instant,
@@ -138,61 +153,69 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     /// [`Action::RequestEntropy`]; until the runtime answers, opens are
     /// refused with [`Error::NeedEntropy`] and inbound SYNs are dropped.
     pub fn new(cfg: Config) -> Self {
-        assert!(CONNS <= 256, "SocketId index is 8 bits");
-        assert!(!cfg.local_addrs.is_empty(), "stack needs at least one local address");
+        assert!(
+            CONNS > 0 && CONNS <= 256,
+            "1 ≤ CONNS ≤ 256 (SocketId index is 8 bits)"
+        );
+        assert!(
+            !cfg.local_addrs.is_empty(),
+            "stack needs at least one local address"
+        );
         Stack {
-            cfg,
-            conns: [const { None }; CONNS],
-            generations: [0; CONNS],
-            listeners: BoundedVec::new(),
-            isn: IsnGenerator::new(),
-            entropy_request_pending: true,
             reasm: Reassembler::new(),
-            pmtu: PmtuCache::new(),
-            actions: BoundedQueue::new(),
-            ctl: BoundedQueue::new(),
-            echo: None,
-            echo_buf: [0; ECHO_BUF_SIZE],
-            emitted_conn_timers: [[None; 4]; CONNS],
             emitted_reasm_timers: [None; REASM_SLOTS],
-            challenge_tokens: 0,
-            challenge_refill_at: Instant::ZERO,
-            ip_ident: 0,
-            next_ephemeral: 49152,
-            poll_cursor: 0,
-            stats: StackStats::default(),
+            core: StackCore {
+                cfg,
+                conns: [const { None }; CONNS],
+                generations: [0; CONNS],
+                listeners: BoundedVec::new(),
+                isn: IsnGenerator::new(),
+                entropy_request_pending: true,
+                pmtu: PmtuCache::new(),
+                actions: BoundedQueue::new(),
+                ctl: BoundedQueue::new(),
+                echo: None,
+                echo_buf: [0; ECHO_BUF_SIZE],
+                emitted_conn_timers: [[None; 4]; CONNS],
+                challenge_tokens: 0,
+                challenge_refill_at: Instant::ZERO,
+                ip_ident: 0,
+                next_ephemeral: 49152,
+                poll_cursor: 0,
+                stats: StackStats::default(),
+            },
         }
     }
 
     /// Stack configuration.
     pub fn config(&self) -> &Config {
-        &self.cfg
+        &self.core.cfg
     }
 
     /// Counters.
     pub fn stats(&self) -> StackStats {
-        self.stats
+        self.core.stats
     }
 
     /// State of a connection, if the handle is live (test/diagnostic aid).
     pub fn state_of(&self, sock: SocketId) -> Option<State> {
-        self.conn_ref(sock).map(|c| c.state())
+        self.core.conn_ref(sock).map(|c| c.state())
     }
 
     /// Local port bound to a connection (test/diagnostic aid).
     pub fn local_port_of(&self, sock: SocketId) -> Option<u16> {
-        self.conn_ref(sock).map(|c| c.local().port)
+        self.core.conn_ref(sock).map(|c| c.local().port)
     }
 
     /// Send-sequence variables `(SND.UNA, SND.NXT, SND.WND)` for a live
     /// connection (test/diagnostic aid).
     pub fn snd_state_of(&self, sock: SocketId) -> Option<(u32, u32, u32)> {
-        self.conn_ref(sock).map(|c| c.snd_state())
+        self.core.conn_ref(sock).map(|c| c.snd_state())
     }
 
     /// RCV.NXT for a live connection (test/diagnostic aid).
     pub fn rcv_nxt_of(&self, sock: SocketId) -> Option<u32> {
-        self.conn_ref(sock).map(|c| c.rcv_nxt())
+        self.core.conn_ref(sock).map(|c| c.rcv_nxt())
     }
 
     /// Desired timer deadlines `[Rexmit, Persist, DelAck, Wait]` for a live
@@ -200,14 +223,16 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     /// has returned `None` — the runtime's armed timers must equal exactly
     /// this; harnesses use it as the two-sided timer-fidelity oracle.
     pub fn timer_deadlines_of(&self, sock: SocketId) -> Option<[Option<Instant>; 4]> {
-        const KINDS: [TimerKind; 4] =
-            [TimerKind::Rexmit, TimerKind::Persist, TimerKind::DelAck, TimerKind::Wait];
-        self.conn_ref(sock).map(|c| KINDS.map(|k| c.timer_deadline(k)))
+        const KINDS: [TimerKind; 4] = [
+            TimerKind::Rexmit,
+            TimerKind::Persist,
+            TimerKind::DelAck,
+            TimerKind::Wait,
+        ];
+        self.core
+            .conn_ref(sock)
+            .map(|c| KINDS.map(|k| c.timer_deadline(k)))
     }
-
-    // ------------------------------------------------------------------
-    // Event entry points
-    // ------------------------------------------------------------------
 
     /// Feed one environment event.
     pub fn handle(&mut self, now: Instant, event: Event<'_>) {
@@ -220,26 +245,16 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
 
     /// Entropy arrived in answer to [`Action::RequestEntropy`].
     pub fn on_entropy(&mut self, bytes: [u8; 16]) {
-        self.isn.seed(bytes);
+        self.core.isn.seed(bytes);
     }
 
     /// A virtual timer fired.
     pub fn on_timer(&mut self, now: Instant, key: TimerKey) {
         match key {
-            TimerKey::Conn { sock, kind } => {
-                let idx = sock.index as usize;
-                if idx >= CONNS || self.generations[idx] != sock.generation {
-                    return; // stale timer for a recycled slot
-                }
-                self.emitted_conn_timers[idx][kind as usize] = None;
-                let Some(conn) = self.conns[idx].as_mut() else { return };
-                let mut fx = Effects::default();
-                conn.on_timer(now, kind, &mut fx);
-                self.process_effects(now, idx, fx);
-            }
-            TimerKey::Reasm { slot } => {
+            TimerKey::Conn { sock, kind } => self.core.on_conn_timer(now, sock, kind),
+            TimerKey::Reasm { slot, generation } => {
                 let slot = slot as usize;
-                if slot < REASM_SLOTS {
+                if slot < REASM_SLOTS && self.reasm.generation(slot) == generation {
                     self.emitted_reasm_timers[slot] = None;
                     self.reasm.on_timer(slot);
                 }
@@ -249,65 +264,188 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
 
     /// A whole IP datagram arrived from the link.
     pub fn on_datagram(&mut self, now: Instant, frame: &[u8]) {
-        self.stats.rx_datagrams += 1;
+        self.core.stats.rx_datagrams += 1;
         match frame.first().map(|b| b >> 4) {
             Some(4) => self.on_ipv4(now, frame),
             Some(6) => self.on_ipv6(now, frame),
-            _ => self.stats.rx_malformed += 1,
+            _ => self.core.stats.rx_malformed += 1,
         }
     }
 
     fn on_ipv4(&mut self, now: Instant, frame: &[u8]) {
         let Ok((h, payload)) = ipv4::parse(frame) else {
-            self.stats.rx_malformed += 1;
+            self.core.stats.rx_malformed += 1;
             return;
         };
         let dst = IpAddr::V4(h.dst);
-        if !self.cfg.is_local(&dst) {
-            self.stats.rx_not_local += 1;
+        if !self.core.cfg.is_local(&dst) {
+            self.core.stats.rx_not_local += 1;
             return; // hosts do not forward (RFC 1122 §3.3.4)
         }
         let src = IpAddr::V4(h.src);
         if h.is_fragment() {
-            let key =
-                ReasmKey { src, dst, proto: h.proto, ident: h.ident as u32 };
+            let key = ReasmKey {
+                src,
+                dst,
+                proto: h.proto,
+                ident: h.ident as u32,
+            };
             self.on_fragment(now, key, h.frag_offset as u32, h.more_frags, payload);
         } else {
-            self.deliver(now, src, dst, h.proto, payload);
+            self.core.deliver(now, src, dst, h.proto, payload);
         }
     }
 
     fn on_ipv6(&mut self, now: Instant, frame: &[u8]) {
         let Ok((h, payload)) = ipv6::parse(frame) else {
-            self.stats.rx_malformed += 1;
+            self.core.stats.rx_malformed += 1;
             return;
         };
         let dst = IpAddr::V6(h.dst);
-        if !self.cfg.is_local(&dst) {
-            self.stats.rx_not_local += 1;
+        if !self.core.cfg.is_local(&dst) {
+            self.core.stats.rx_not_local += 1;
             return;
         }
         let src = IpAddr::V6(h.src);
         if let Some(frag) = h.frag {
-            let key = ReasmKey { src, dst, proto: frag.next, ident: frag.ident };
+            let key = ReasmKey {
+                src,
+                dst,
+                proto: frag.next,
+                ident: frag.ident,
+            };
             self.on_fragment(now, key, frag.offset as u32, frag.more, payload);
         } else {
-            self.deliver(now, src, dst, h.proto, payload);
+            self.core.deliver(now, src, dst, h.proto, payload);
         }
     }
 
     fn on_fragment(&mut self, now: Instant, key: ReasmKey, off: u32, more: bool, data: &[u8]) {
-        let timeout = self.cfg.reassembly_timeout;
+        let timeout = self.core.cfg.reassembly_timeout;
         if let ReasmResult::Complete { slot } = self.reasm.push(now, timeout, key, off, more, data)
         {
-            let mut buf = [0u8; REASM_BUF_SIZE];
-            if let Some((key, len)) = self.reasm.take(slot, &mut buf) {
-                self.deliver(now, key.src, key.dst, key.proto, &buf[..len]);
+            // DEF-M6: borrow the reassembled payload directly from the
+            // reassembler slot and deliver via the disjoint `core` field —
+            // no [`REASM_BUF_SIZE`]-byte copy on the call stack. `&self.reasm`
+            // and `&mut self.core` are disjoint borrows of `self`.
+            if let Some((key, payload)) = self.reasm.completed(slot) {
+                self.core.deliver(now, key.src, key.dst, key.proto, payload);
             }
+            self.reasm.release(slot);
         }
     }
 
+    // ----- Application API: thin delegation to `core` -----
+
+    /// Start accepting connections on `port` (any local address).
+    pub fn listen(&mut self, port: u16) -> Result<(), Error> {
+        self.core.listen(port)
+    }
+    /// Stop accepting connections on `port` (existing connections live on).
+    pub fn unlisten(&mut self, port: u16) {
+        self.core.unlisten(port);
+    }
+    /// Active open to `remote` from an automatic local endpoint.
+    pub fn connect(&mut self, now: Instant, remote: SocketAddr) -> Result<SocketId, Error> {
+        self.core.connect(now, remote)
+    }
+    /// Active open with an explicit local endpoint.
+    pub fn connect_from(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<SocketId, Error> {
+        self.core.connect_from(now, local, remote)
+    }
+    /// Queue bytes for sending; returns how many were accepted.
+    pub fn send(&mut self, sock: SocketId, data: &[u8]) -> Result<usize, Error> {
+        self.core.conn_mut(sock)?.send(data)
+    }
+    /// Read received bytes; `Ok(0)` means none pending (EOF is signaled via
+    /// [`AppEvent::PeerFinReceived`]).
+    pub fn recv(&mut self, sock: SocketId, out: &mut [u8]) -> Result<usize, Error> {
+        self.core.conn_mut(sock)?.recv(out)
+    }
+    /// Graceful close: FIN after queued data; receiving continues.
+    pub fn close(&mut self, now: Instant, sock: SocketId) -> Result<(), Error> {
+        self.core.close(now, sock)
+    }
+    /// Abort: RST the peer and drop everything immediately.
+    pub fn abort(&mut self, now: Instant, sock: SocketId) -> Result<(), Error> {
+        self.core.abort(now, sock)
+    }
+
+    /// Drain the next pending action. `tx` must be at least MTU bytes; when
+    /// the result is [`Action::Transmit`], the datagram occupies
+    /// `tx[..len]`. Call repeatedly until `None` after every event.
+    pub fn poll_action(&mut self, now: Instant, tx: &mut [u8]) -> Option<Action> {
+        if let Some(a) = self.core.poll_action_core(now, tx) {
+            return Some(a);
+        }
+        // Quiescent: reconcile timers, free dead slots, surface anything
+        // those steps queued.
+        self.sweep(now);
+        self.core.actions.pop_front()
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        self.core.sweep_conns(now);
+        for slot in 0..REASM_SLOTS {
+            let desired = self.reasm.deadline(slot);
+            let emitted = self.emitted_reasm_timers[slot];
+            let key = TimerKey::Reasm {
+                slot: slot as u8,
+                generation: self.reasm.generation(slot),
+            };
+            match (desired, emitted) {
+                (Some(d), e) if e != Some(d) => {
+                    if self.core.queue_action(Action::StartTimer {
+                        key,
+                        after: d.saturating_since(now),
+                    }) {
+                        self.emitted_reasm_timers[slot] = Some(d);
+                    }
+                }
+                (None, Some(_)) if self.core.queue_action(Action::CancelTimer { key }) => {
+                    self.emitted_reasm_timers[slot] = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SND, RCV> {
+    fn on_conn_timer(&mut self, now: Instant, sock: SocketId, kind: TimerKind) {
+        let idx = sock.index as usize;
+        if idx >= CONNS || self.generations[idx] != sock.generation {
+            return; // stale timer for a recycled slot
+        }
+        self.emitted_conn_timers[idx][kind as usize] = None;
+        let Some(conn) = self.conns[idx].as_mut() else {
+            return;
+        };
+        let mut fx = Effects::default();
+        conn.on_timer(now, kind, &mut fx);
+        self.process_effects(now, idx, fx);
+    }
+
+    /// Dispatch an upper-layer payload to its protocol handler. The
+    /// reassembled-IPv6 path may carry leading extension headers (RFC 8200
+    /// §4.5, DEF-L14); they are walked here so reassembled and unfragmented
+    /// datagrams take the same dispatch.
     fn deliver(&mut self, now: Instant, src: IpAddr, dst: IpAddr, proto_nr: u8, payload: &[u8]) {
+        let (proto_nr, payload) = match (src.is_v4(), ipv6::walk_payload(proto_nr, payload)) {
+            // IPv4 has no extension headers; IPv6 walks any in the
+            // (possibly reassembled) payload.
+            (true, _) => (proto_nr, payload),
+            (false, Ok((p, body))) => (p, body),
+            (false, Err(_)) => {
+                self.stats.rx_malformed += 1;
+                return;
+            }
+        };
         match proto_nr {
             proto::TCP => self.deliver_tcp(now, src, dst, payload),
             proto::ICMP if src.is_v4() => self.deliver_icmp4(now, src, dst, payload),
@@ -322,8 +460,7 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     // API calls
     // ------------------------------------------------------------------
 
-    /// Start accepting connections on `port` (any local address).
-    pub fn listen(&mut self, port: u16) -> Result<(), Error> {
+    fn listen(&mut self, port: u16) -> Result<(), Error> {
         if port == 0 {
             return Err(Error::Unaddressable);
         }
@@ -333,13 +470,11 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         self.listeners.push(port).map_err(|_| Error::BufferFull)
     }
 
-    /// Stop accepting connections on `port` (existing connections live on).
-    pub fn unlisten(&mut self, port: u16) {
+    fn unlisten(&mut self, port: u16) {
         self.listeners.retain(|&p| p != port);
     }
 
-    /// Active open to `remote` from an automatic local endpoint.
-    pub fn connect(&mut self, now: Instant, remote: SocketAddr) -> Result<SocketId, Error> {
+    fn connect(&mut self, now: Instant, remote: SocketAddr) -> Result<SocketId, Error> {
         let local_ip = *self
             .cfg
             .local_addrs
@@ -350,14 +485,17 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         self.connect_from(now, SocketAddr::new(local_ip, port), remote)
     }
 
-    /// Active open with an explicit local endpoint.
-    pub fn connect_from(
+    fn connect_from(
         &mut self,
         now: Instant,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Result<SocketId, Error> {
-        if !local.ip.same_family(&remote.ip) || remote.port == 0 {
+        if !local.ip.same_family(&remote.ip)
+            || remote.port == 0
+            || local.port == 0
+            || !remote.ip.is_unicast_source()
+        {
             return Err(Error::Unaddressable);
         }
         if !self.cfg.is_local(&local.ip) {
@@ -371,37 +509,29 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         }
         let idx = self.free_slot().ok_or(Error::NoSlot)?;
         let params = self.conn_params(now, &remote.ip);
-        let iss = self.isn.generate(now, local, remote).ok_or(Error::NeedEntropy)?;
+        let iss = self
+            .isn
+            .generate(now, local, remote)
+            .ok_or(Error::NeedEntropy)?;
         self.conns[idx] = Some(Connection::client(&self.cfg, params, local, remote, iss));
-        Ok(SocketId { index: idx as u8, generation: self.generations[idx] })
+        Ok(SocketId {
+            index: idx as u8,
+            generation: self.generations[idx],
+        })
     }
 
-    /// Queue bytes for sending; returns how many were accepted.
-    pub fn send(&mut self, sock: SocketId, data: &[u8]) -> Result<usize, Error> {
-        self.conn_mut(sock)?.send(data)
-    }
-
-    /// Read received bytes; `Ok(0)` means none pending (EOF is signaled via
-    /// [`AppEvent::PeerFinReceived`]).
-    pub fn recv(&mut self, sock: SocketId, out: &mut [u8]) -> Result<usize, Error> {
-        self.conn_mut(sock)?.recv(out)
-    }
-
-    /// Graceful close: FIN after queued data; receiving continues.
-    pub fn close(&mut self, sock: SocketId) -> Result<(), Error> {
+    fn close(&mut self, now: Instant, sock: SocketId) -> Result<(), Error> {
         let idx = self.index_of(sock)?;
         let mut fx = Effects::default();
         let result = match self.conns[idx].as_mut() {
             Some(conn) => conn.close(&mut fx),
             None => Err(Error::NotFound),
         };
-        // `Instant::ZERO` is fine here: close() itself never arms timers.
-        self.process_effects(Instant::ZERO, idx, fx);
+        self.process_effects(now, idx, fx);
         result
     }
 
-    /// Abort: RST the peer and drop everything immediately.
-    pub fn abort(&mut self, sock: SocketId) -> Result<(), Error> {
+    fn abort(&mut self, now: Instant, sock: SocketId) -> Result<(), Error> {
         let idx = self.index_of(sock)?;
         let mut fx = Effects::default();
         let (rst, local, remote) = match self.conns[idx].as_mut() {
@@ -411,7 +541,7 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         if let Some(r) = rst {
             self.queue_reset(local, remote, r);
         }
-        self.process_effects(Instant::ZERO, idx, fx);
+        self.process_effects(now, idx, fx);
         Ok(())
     }
 
@@ -440,23 +570,54 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
 
     fn find_conn(&self, local: &SocketAddr, remote: &SocketAddr) -> Option<usize> {
         self.conns.iter().position(|c| {
-            c.as_ref().is_some_and(|c| c.local() == *local && c.remote() == *remote)
+            c.as_ref()
+                .is_some_and(|c| c.local() == *local && c.remote() == *remote)
         })
     }
 
     fn free_slot(&self) -> Option<usize> {
+        // A Closed conn awaiting its shed-cancel retry (DEF-L2) is *not*
+        // free: reusing it would alias the old generation. It frees on the
+        // next drained sweep, so this only matters under A-POLL-1 backlog.
         self.conns.iter().position(|c| c.is_none())
     }
 
     fn alloc_ephemeral(&mut self, remote: &SocketAddr) -> Result<u16, Error> {
-        // Deterministic rotation through the dynamic range (RFC 6335 §6).
-        for _ in 0..=(u16::MAX - 49152) {
-            let port = self.next_ephemeral;
-            self.next_ephemeral =
-                if self.next_ephemeral == u16::MAX { 49152 } else { self.next_ephemeral + 1 };
-            let clash = self.conns.iter().flatten().any(|c| {
-                c.local().port == port && c.remote() == *remote
-            });
+        // RFC 6056 Algorithm 5 (double-hash port selection): an off-path
+        // observer of one outbound connection learns nothing about the
+        // source port of the next, restoring ~14 bits of entropy to the
+        // 4-tuple (S-PORT-1). Deterministic given the entropy seed, so
+        // replay still works. Falls back to a fixed scan only before
+        // entropy is provided (in which case `connect` fails anyway).
+        const LO: u16 = 49152;
+        const SPAN: u32 = (u16::MAX - LO) as u32 + 1;
+        let counter = self.next_ephemeral;
+        self.next_ephemeral = self.next_ephemeral.wrapping_add(1);
+        // Per-destination table index → independent sequences per remote;
+        // global increment → no immediate reuse on the same remote.
+        let dst_hash = match remote.ip {
+            IpAddr::V4(b) => u32::from_be_bytes(b) as u64,
+            IpAddr::V6(b) => {
+                u64::from_be_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
+            }
+        }
+        .wrapping_add((remote.port as u64) << 32);
+        let offset = self
+            .isn
+            .keyed_hash(
+                domain::EPHEMERAL_PORT,
+                dst_hash.wrapping_add(counter as u64),
+            )
+            .unwrap_or(counter as u64);
+        let base = LO + (offset % SPAN as u64) as u16;
+        for i in 0..SPAN {
+            let port = LO + ((base as u32 - LO as u32 + i) % SPAN) as u16;
+            let clash = self.listeners.iter().any(|&p| p == port)
+                || self
+                    .conns
+                    .iter()
+                    .flatten()
+                    .any(|c| c.local().port == port && c.remote() == *remote);
             if !clash {
                 return Ok(port);
             }
@@ -465,8 +626,16 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     }
 
     fn conn_params(&self, now: Instant, remote_ip: &IpAddr) -> ConnParams {
-        let overhead = if remote_ip.is_v4() { V4_OVERHEAD } else { V6_OVERHEAD };
-        let floor = if remote_ip.is_v4() { IPV4_MIN_PMTU } else { IPV6_MIN_PMTU };
+        let overhead = if remote_ip.is_v4() {
+            V4_OVERHEAD
+        } else {
+            V6_OVERHEAD
+        };
+        let floor = if remote_ip.is_v4() {
+            IPV4_MIN_PMTU
+        } else {
+            IPV6_MIN_PMTU
+        };
         let local_mss = self
             .cfg
             .mss_override
@@ -474,14 +643,20 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         let pmtu = self.pmtu.get(now, self.cfg.mtu, remote_ip).max(floor);
         ConnParams {
             local_mss,
-            offer_wscale: self.cfg.offer_window_scale.then_some(self.cfg.recv_window_scale.min(14)),
+            offer_wscale: self
+                .cfg
+                .offer_window_scale
+                .then_some(self.cfg.recv_window_scale.min(14)),
             offer_sack: self.cfg.sack,
             pmtu_mss: pmtu - overhead,
         }
     }
 
     fn sock_at(&self, idx: usize) -> SocketId {
-        SocketId { index: idx as u8, generation: self.generations[idx] }
+        SocketId {
+            index: idx as u8,
+            generation: self.generations[idx],
+        }
     }
 
     /// Translate connection effects into queued actions.
@@ -532,13 +707,32 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
 
     fn queue_reset(&mut self, local: SocketAddr, remote: SocketAddr, r: ResetReply) {
         self.stats.rst_tx += 1;
-        let _ = self.ctl.push_back(CtlSegment { local, remote, seq: r.seq, ack: r.ack });
+        let _ = self.ctl.push_back(CtlSegment {
+            local,
+            remote,
+            seq: r.seq,
+            ack: r.ack,
+        });
     }
 
     /// RFC 5961 §10: token-bucket limit on challenge ACKs.
+    ///
+    /// The per-second budget is keyed-hash randomized in `[cap/2, cap]`
+    /// (S-CHALLENGE-1). A fixed, global, deterministic cap is the
+    /// CVE-2016-5696 side channel: an off-path attacker with one connection
+    /// of their own can count returned challenge ACKs to learn whether a
+    /// spoofed probe to a victim 4-tuple consumed a token, and binary-search
+    /// the victim's RCV.NXT. Jittering the cap per second removes the exact
+    /// reference the attacker needs.
     fn take_challenge_token(&mut self, now: Instant) -> bool {
         if now >= self.challenge_refill_at {
-            self.challenge_tokens = self.cfg.challenge_acks_per_sec;
+            let cap = self.cfg.challenge_acks_per_sec;
+            let jitter = self
+                .isn
+                .keyed_hash(domain::CHALLENGE_ACK, now.as_micros() / 1_000_000)
+                .map(|h| (h % (cap as u64 / 2 + 1)) as u8)
+                .unwrap_or(0);
+            self.challenge_tokens = cap.saturating_sub(jitter).max(1);
             self.challenge_refill_at = now + Duration::from_secs(1);
         }
         if self.challenge_tokens > 0 {
@@ -549,9 +743,17 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         }
     }
 
+    /// IPv4 identification field (RFC 6864 / RFC 7739, S-IPID-1). For
+    /// atomic (DF) datagrams the value is semantically meaningless, so we
+    /// keyed-hash it to deny the idle-scan / traffic-volume side channel a
+    /// global counter exposes. Non-DF datagrams from the same flow still get
+    /// distinct IDs (the counter is mixed in) so reassembly works.
     fn next_ident(&mut self) -> u16 {
         self.ip_ident = self.ip_ident.wrapping_add(1);
-        self.ip_ident
+        self.isn
+            .keyed_hash(domain::IP_IDENT, self.ip_ident as u64)
+            .map(|h| h as u16)
+            .unwrap_or(self.ip_ident)
     }
 
     // ------------------------------------------------------------------
@@ -559,6 +761,13 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     // ------------------------------------------------------------------
 
     fn deliver_tcp(&mut self, now: Instant, src: IpAddr, dst: IpAddr, seg: &[u8]) {
+        // S-MARTIAN-1: never reply to a non-unicast source. RFC 1122
+        // §4.2.3.10 (MUST silently discard), and prevents reflection toward
+        // multicast/broadcast (Smurf-class) and LAND (`src == dst`) loops.
+        if !src.is_unicast_source() || src == dst {
+            self.stats.rx_martian_src += 1;
+            return;
+        }
         let Ok((h, opts, payload)) = crate::wire::tcp::parse(seg, &src, &dst) else {
             self.stats.rx_malformed += 1;
             return;
@@ -595,12 +804,21 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         }
         let reply = if h.flags.ack() {
             // "<SEQ=SEG.ACK><CTL=RST>"
-            CtlSegment { local, remote, seq: SeqNr(h.ack), ack: None }
+            CtlSegment {
+                local,
+                remote,
+                seq: SeqNr(h.ack),
+                ack: None,
+            }
         } else {
             // "<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>"
-            let seg_len =
-                payload.len() as u32 + h.flags.syn() as u32 + h.flags.fin() as u32;
-            CtlSegment { local, remote, seq: SeqNr(0), ack: Some(SeqNr(h.seq).add(seg_len)) }
+            let seg_len = payload.len() as u32 + h.flags.syn() as u32 + h.flags.fin() as u32;
+            CtlSegment {
+                local,
+                remote,
+                seq: SeqNr(0),
+                ack: Some(SeqNr(h.seq).add(seg_len)),
+            }
         };
         self.stats.rst_tx += 1;
         let _ = self.ctl.push_back(reply);
@@ -623,7 +841,9 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             // of scope; a dropped SYN is retried by the peer)
         };
         let params = self.conn_params(now, &remote.ip);
-        let Some(iss) = self.isn.generate(now, local, remote) else { return };
+        let Some(iss) = self.isn.generate(now, local, remote) else {
+            return;
+        };
         self.conns[idx] = Some(Connection::server(
             &self.cfg,
             params,
@@ -650,21 +870,25 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         match (m.kind, m.code) {
             (icmp::v4::ECHO_REQUEST, 0) => self.queue_echo(src, dst, m.rest, rest),
             (icmp::v4::DEST_UNREACHABLE, code) => {
-                let Ok((qh, ql4)) = ipv4::parse_quote(rest) else { return };
+                let Ok((qh, ql4)) = ipv4::parse_quote(rest) else {
+                    return;
+                };
                 if qh.proto != proto::TCP {
                     return;
                 }
                 let Ok(q) = icmp::quoted_tcp(ql4) else { return };
                 let local = SocketAddr::new(IpAddr::V4(qh.src), q.src_port);
                 let remote = SocketAddr::new(IpAddr::V4(qh.dst), q.dst_port);
-                self.icmp_error_for(now, local, remote, SeqNr(q.seq), code, m.mtu());
+                self.icmp_error_for(now, local, remote, SeqNr(q.seq), code, m.mtu_v4() as u32);
             }
             _ => {} // time-exceeded etc.: advisory only
         }
     }
 
     fn deliver_icmp6(&mut self, now: Instant, src: IpAddr, dst: IpAddr, body: &[u8]) {
-        let (IpAddr::V6(s6), IpAddr::V6(d6)) = (&src, &dst) else { return };
+        let (IpAddr::V6(s6), IpAddr::V6(d6)) = (&src, &dst) else {
+            return;
+        };
         let Ok((m, rest)) = icmp::parse_v6(body, s6, d6) else {
             self.stats.rx_malformed += 1;
             return;
@@ -672,7 +896,9 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         match m.kind {
             icmp::v6::ECHO_REQUEST => self.queue_echo(src, dst, m.rest, rest),
             icmp::v6::PACKET_TOO_BIG | icmp::v6::DEST_UNREACHABLE => {
-                let Ok((qsrc, qdst, qnext, ql4)) = ipv6::parse_quote(rest) else { return };
+                let Ok((qsrc, qdst, qnext, ql4)) = ipv6::parse_quote(rest) else {
+                    return;
+                };
                 if qnext != proto::TCP {
                     return;
                 }
@@ -687,7 +913,7 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
                         remote,
                         SeqNr(q.seq),
                         icmp::v4::CODE_FRAG_NEEDED,
-                        m.mtu(),
+                        m.mtu_v6(),
                     );
                 } else if m.code == icmp::v6::CODE_PORT_UNREACHABLE {
                     self.icmp_error_for(now, local, remote, SeqNr(q.seq), u8::MAX, 0);
@@ -708,16 +934,26 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         code: u8,
         reported_mtu: u32,
     ) {
-        let Some(idx) = self.find_conn(&local, &remote) else { return };
-        let Some(conn) = self.conns[idx].as_mut() else { return };
+        let Some(idx) = self.find_conn(&local, &remote) else {
+            return;
+        };
+        let Some(conn) = self.conns[idx].as_mut() else {
+            return;
+        };
         // RFC 5927 §4: ignore errors whose quote could not be in flight.
         if !conn.icmp_quote_plausible(quoted_seq) {
             return;
         }
         if code == icmp::v4::CODE_FRAG_NEEDED {
             // Path MTU discovery (RFC 1191 / RFC 8201).
-            let overhead = if remote.ip.is_v4() { V4_OVERHEAD } else { V6_OVERHEAD };
-            if let Some(new_pmtu) = self.pmtu.update(now, self.cfg.mtu, &remote.ip, reported_mtu)
+            let overhead = if remote.ip.is_v4() {
+                V4_OVERHEAD
+            } else {
+                V6_OVERHEAD
+            };
+            if let Some(new_pmtu) = self
+                .pmtu
+                .update(now, self.cfg.mtu, &remote.ip, reported_mtu)
                 && let Some(conn) = self.conns[idx].as_mut()
             {
                 conn.on_pmtu_change(new_pmtu - overhead);
@@ -737,23 +973,33 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         if !self.cfg.answer_echo || self.echo.is_some() {
             return; // one pending reply; floods are shed
         }
+        if !src.is_unicast_source() || src == dst {
+            self.stats.rx_martian_src += 1;
+            return; // S-MARTIAN-1: never reflect to multicast/broadcast
+        }
         let overhead = if src.is_v4() { 20 + 8 } else { 40 + 8 };
         if payload.len() + overhead > self.cfg.mtu as usize || payload.len() > ECHO_BUF_SIZE {
             return;
         }
         self.echo_buf[..payload.len()].copy_from_slice(payload);
-        self.echo = Some(EchoReply { local: dst, remote: src, rest, len: payload.len() });
+        self.echo = Some(EchoReply {
+            local: dst,
+            remote: src,
+            rest,
+            len: payload.len(),
+        });
     }
 
     // ------------------------------------------------------------------
-    // Output: poll_action and serialization
+    // Output: action drain and serialization (the reasm-timer reconcile and
+    // final sweep live on `Stack::poll_action` / `Stack::sweep`).
     // ------------------------------------------------------------------
 
-    /// Drain the next pending action. `tx` must be at least MTU bytes; when
-    /// the result is [`Action::Transmit`], the datagram occupies
-    /// `tx[..len]`. Call repeatedly until `None` after every event.
-    pub fn poll_action(&mut self, now: Instant, tx: &mut [u8]) -> Option<Action> {
-        debug_assert!(tx.len() >= self.cfg.mtu as usize, "tx buffer must hold one MTU");
+    fn poll_action_core(&mut self, now: Instant, tx: &mut [u8]) -> Option<Action> {
+        debug_assert!(
+            tx.len() >= self.cfg.mtu as usize,
+            "tx buffer must hold one MTU"
+        );
         if self.entropy_request_pending {
             self.entropy_request_pending = false;
             return Some(Action::RequestEntropy);
@@ -788,54 +1034,43 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
                 return Some(Action::Transmit { len });
             }
         }
-        // Quiescent: reconcile timers, free dead slots, surface anything
-        // those steps queued.
-        self.sweep(now);
-        self.actions.pop_front()
+        None
     }
 
-    fn sweep(&mut self, now: Instant) {
+    fn sweep_conns(&mut self, now: Instant) {
         for idx in 0..CONNS {
             if let Some(conn) = self.conns[idx].as_mut() {
                 if conn.is_closed() {
-                    self.conns[idx] = None;
-                    // Cancel timers BEFORE bumping the generation: the cancel
-                    // keys must carry the generation the runtime armed them
-                    // under, or they match nothing and the runtime keeps
-                    // phantom timers until they fire (filtered, but leaked).
+                    // Cancel timers BEFORE freeing the slot or bumping the
+                    // generation: the cancel keys must carry the generation
+                    // the runtime armed them under, or they match nothing
+                    // and the runtime keeps phantom timers until they fire
+                    // (filtered, but leaked). If a cancel is *shed* (queue
+                    // full under an A-POLL-1 backlog), the slot stays
+                    // occupied-but-Closed and the next sweep retries —
+                    // freeing it now would orphan the cancel: empty slots
+                    // are not reconciled, and a post-bump retry would carry
+                    // the wrong generation (DEF-L2).
                     self.reconcile_conn_timers(now, idx);
-                    self.generations[idx] = self.generations[idx].wrapping_add(1);
+                    if self.emitted_conn_timers[idx] == [None; 4] {
+                        self.conns[idx] = None;
+                        self.generations[idx] = self.generations[idx].wrapping_add(1);
+                    }
                     continue;
                 }
                 conn.update_send_timers(now);
                 self.reconcile_conn_timers(now, idx);
             }
         }
-        for slot in 0..REASM_SLOTS {
-            let desired = self.reasm.deadline(slot);
-            let emitted = self.emitted_reasm_timers[slot];
-            let key = TimerKey::Reasm { slot: slot as u8 };
-            match (desired, emitted) {
-                (Some(d), e) if e != Some(d) => {
-                    // As in reconcile_conn_timers: only record what the queue
-                    // actually accepted, so shed actions are retried.
-                    if self.queue_action(Action::StartTimer { key, after: d.saturating_since(now) })
-                    {
-                        self.emitted_reasm_timers[slot] = Some(d);
-                    }
-                }
-                // See reconcile_conn_timers: failed pushes retry next sweep.
-                (None, Some(_)) if self.queue_action(Action::CancelTimer { key }) => {
-                    self.emitted_reasm_timers[slot] = None;
-                }
-                _ => {}
-            }
-        }
     }
 
     fn reconcile_conn_timers(&mut self, now: Instant, idx: usize) {
-        const KINDS: [TimerKind; 4] =
-            [TimerKind::Rexmit, TimerKind::Persist, TimerKind::DelAck, TimerKind::Wait];
+        const KINDS: [TimerKind; 4] = [
+            TimerKind::Rexmit,
+            TimerKind::Persist,
+            TimerKind::DelAck,
+            TimerKind::Wait,
+        ];
         let desired: [Option<Instant>; 4] = match self.conns[idx].as_ref() {
             Some(c) => KINDS.map(|k| c.timer_deadline(k)),
             None => [None; 4],
@@ -848,8 +1083,10 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
                     // Record as emitted only if the queue accepted it, so a
                     // shed action stays desired≠emitted and is retried by the
                     // next reconcile instead of being lost.
-                    if self.queue_action(Action::StartTimer { key, after: d.saturating_since(now) })
-                    {
+                    if self.queue_action(Action::StartTimer {
+                        key,
+                        after: d.saturating_since(now),
+                    }) {
                         self.emitted_conn_timers[idx][k] = Some(d);
                     }
                 }
@@ -866,7 +1103,9 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     fn emit_plan(&mut self, idx: usize, plan: &SegmentPlan, tx: &mut [u8]) -> usize {
         let ident = self.next_ident();
         let ttl = self.cfg.ttl;
-        let Some(conn) = self.conns[idx].as_ref() else { return 0 };
+        let Some(conn) = self.conns[idx].as_ref() else {
+            return 0;
+        };
         let mut flags = plan.flags;
         if plan.ack.is_some() {
             flags = flags.union(TcpFlags::ACK);
@@ -887,7 +1126,9 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             window: plan.window,
             options,
         };
-        let payload = conn.send_buf.read(plan.payload_off as usize, plan.payload_len as usize);
+        let payload = conn
+            .send_buf
+            .read(plan.payload_off as usize, plan.payload_len as usize);
         let (local, remote) = (conn.local().ip, conn.remote().ip);
         emit_tcp_ip(&local, &remote, &emit, payload, ttl, ident, tx)
     }
@@ -907,7 +1148,15 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             options: TcpOptionsEmit::default(),
         };
         let ident = self.next_ident();
-        emit_tcp_ip(&c.local.ip, &c.remote.ip, &emit, (&[], &[]), self.cfg.ttl, ident, tx)
+        emit_tcp_ip(
+            &c.local.ip,
+            &c.remote.ip,
+            &emit,
+            (&[], &[]),
+            self.cfg.ttl,
+            ident,
+            tx,
+        )
     }
 
     fn emit_echo(&mut self, e: &EchoReply, tx: &mut [u8]) -> usize {
@@ -992,7 +1241,9 @@ mod tests {
     fn custom_recv_capacity_drives_advertised_window() {
         let mut s = seeded(IpAddr::v4(10, 0, 0, 1));
         let now = Instant::ZERO;
-        let _sock = s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80)).unwrap();
+        let _sock = s
+            .connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80))
+            .unwrap();
         // Drain to the SYN datagram and parse its window field.
         let mut tx = [0u8; 1500];
         let mut window = None;
@@ -1020,8 +1271,14 @@ mod tests {
         let mut s = seeded(IpAddr::v4(10, 0, 0, 1));
         let now = Instant::ZERO;
         // Two slots: two opens succeed, the third reports NoSlot.
-        assert!(s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 1)).is_ok());
-        assert!(s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 2)).is_ok());
+        assert!(
+            s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 1))
+                .is_ok()
+        );
+        assert!(
+            s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 2))
+                .is_ok()
+        );
         assert_eq!(
             s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 3)),
             Err(Error::NoSlot)
@@ -1044,25 +1301,33 @@ mod tests {
 
         // Open a connection and drain to quiescence: the SYN is emitted and
         // its retransmit timer is armed runtime-side (emitted == desired).
-        let sock = s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80)).unwrap();
+        let sock = s
+            .connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80))
+            .unwrap();
         while s.poll_action(now, &mut tx).is_some() {}
         let idx = sock.index as usize;
         let rexmit = TimerKind::Rexmit as usize;
-        assert!(s.emitted_conn_timers[idx][rexmit].is_some(), "SYN rexmit timer armed");
+        assert!(
+            s.core.emitted_conn_timers[idx][rexmit].is_some(),
+            "SYN rexmit timer armed"
+        );
 
         // Simulate the backlog moment the bug needed: the runtime has NOT
         // been told about the deadline, and the action queue is full.
-        s.emitted_conn_timers[idx][rexmit] = None;
-        while s.actions.push_back(Action::RequestEntropy).is_ok() {}
-        let shed_before = s.stats.actions_shed;
+        s.core.emitted_conn_timers[idx][rexmit] = None;
+        while s.core.actions.push_back(Action::RequestEntropy).is_ok() {}
+        let shed_before = s.core.stats.actions_shed;
 
-        s.reconcile_conn_timers(now, idx);
+        s.core.reconcile_conn_timers(now, idx);
 
         // The shed StartTimer must be counted and must NOT be marked
         // emitted — that lie is what made the loss permanent.
-        assert!(s.stats.actions_shed > shed_before, "shed action is observable in stats");
         assert!(
-            s.emitted_conn_timers[idx][rexmit].is_none(),
+            s.core.stats.actions_shed > shed_before,
+            "shed action is observable in stats"
+        );
+        assert!(
+            s.core.emitted_conn_timers[idx][rexmit].is_none(),
             "a shed StartTimer must not be recorded as delivered"
         );
 
@@ -1070,14 +1335,27 @@ mod tests {
         // still pending, so the sweep re-offers the StartTimer.
         let mut rearmed = false;
         while let Some(a) = s.poll_action(now, &mut tx) {
-            if let Action::StartTimer { key: TimerKey::Conn { sock: k, kind: TimerKind::Rexmit }, .. } = a
+            if let Action::StartTimer {
+                key:
+                    TimerKey::Conn {
+                        sock: k,
+                        kind: TimerKind::Rexmit,
+                    },
+                ..
+            } = a
                 && k == sock
             {
                 rearmed = true;
             }
         }
-        assert!(rearmed, "retried StartTimer delivered after the backlog cleared");
-        assert!(s.emitted_conn_timers[idx][rexmit].is_some(), "emitted state reconverged");
+        assert!(
+            rearmed,
+            "retried StartTimer delivered after the backlog cleared"
+        );
+        assert!(
+            s.core.emitted_conn_timers[idx][rexmit].is_some(),
+            "emitted state reconverged"
+        );
     }
 
     /// When a dead slot is reaped, its `CancelTimer` actions must carry the
@@ -1093,15 +1371,23 @@ mod tests {
         let mut tx = [0u8; 1500];
 
         // SYN emitted: the runtime armed Rexmit under `sock`'s generation.
-        let sock = s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80)).unwrap();
+        let sock = s
+            .connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80))
+            .unwrap();
         while s.poll_action(now, &mut tx).is_some() {}
 
         // Abort and reap. The drain must cancel the Rexmit timer with the
         // SAME key it was armed under.
-        s.abort(sock).unwrap();
+        s.abort(now, sock).unwrap();
         let mut cancelled_original = false;
         while let Some(a) = s.poll_action(now, &mut tx) {
-            if let Action::CancelTimer { key: TimerKey::Conn { sock: k, kind: TimerKind::Rexmit } } = a
+            if let Action::CancelTimer {
+                key:
+                    TimerKey::Conn {
+                        sock: k,
+                        kind: TimerKind::Rexmit,
+                    },
+            } = a
                 && k == sock
             {
                 cancelled_original = true;

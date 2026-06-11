@@ -28,7 +28,11 @@ impl<const CAP: usize> Default for SendBuffer<CAP> {
 impl<const CAP: usize> SendBuffer<CAP> {
     /// An empty buffer.
     pub const fn new() -> Self {
-        SendBuffer { buf: [0; CAP], start: 0, len: 0 }
+        SendBuffer {
+            buf: [0; CAP],
+            start: 0,
+            len: 0,
+        }
     }
 
     /// Total capacity in bytes.

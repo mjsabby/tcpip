@@ -61,7 +61,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             if ack.le(self.iss) || ack.gt(self.snd_nxt) {
                 // "send a reset (unless the RST bit is set)" then drop.
                 if !h.flags.rst() {
-                    fx.reset_reply = Some(ResetReply { seq: ack, ack: None });
+                    fx.reset_reply = Some(ResetReply {
+                        seq: ack,
+                        ack: None,
+                    });
                 }
                 return;
             }
@@ -93,6 +96,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             if ack_acceptable {
                 // Our SYN is acknowledged: SYN-SENT → ESTABLISHED.
                 self.take_rtt_sample(now, ack);
+                self.syn_acked = true;
                 self.snd_una = ack;
                 self.snd_wl2 = ack;
                 self.rexmit_count = 0;
@@ -128,8 +132,19 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         let seq = SeqNr(h.seq);
         let ack = SeqNr(h.ack);
         let wnd = self.recv_buf.window();
-        let seg_len =
-            payload.len() as u32 + h.flags.syn() as u32 + h.flags.fin() as u32;
+        let seg_len = payload.len() as u32 + h.flags.syn() as u32 + h.flags.fin() as u32;
+
+        // ---- Step 4 first: SYN (RFC 5961 §4.2) ----
+        // RFC 5961 hoists the SYN check above the sequence-acceptability
+        // check: a SYN MUST elicit a challenge ACK *irrespective of sequence
+        // number*. Doing it after meant out-of-window SYNs took the
+        // unconditional-ACK path while in-window SYNs consumed a challenge
+        // token — a perfect oracle for the CVE-2016-5696 side channel
+        // (DEF-M10).
+        if h.flags.syn() && !h.flags.rst() {
+            fx.wants_challenge = true;
+            return;
+        }
 
         // ---- Step 1: sequence acceptability ----
         if !seq_acceptable(self.rcv_nxt, wnd, seq, seg_len) {
@@ -150,21 +165,19 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
         // ---- Step 2: RST (RFC 5961 §3.2) ----
         if h.flags.rst() {
+            if self.state == State::TimeWait {
+                // RFC 1337 / RFC 9293 §3.10.7.4 note: ignore RST in
+                // TIME-WAIT. Honoring it lets a rebooted peer's reflexive
+                // RST destroy the 2·MSL quarantine and admit old segments
+                // into a successor connection (DEF-H2).
+                return;
+            }
             if seq == self.rcv_nxt {
                 self.process_rst(fx);
             } else {
                 // In-window but not exact: challenge ACK instead of reset.
                 fx.wants_challenge = true;
             }
-            return;
-        }
-
-        // ---- Step 4: SYN (RFC 5961 §4.2) ----
-        if h.flags.syn() {
-            // In-window SYN in a synchronized state: challenge ACK, drop.
-            // (This also covers SYN-RECEIVED; the challenge re-asserts our
-            // state to a peer that may have rebooted.)
-            fx.wants_challenge = true;
             return;
         }
 
@@ -183,7 +196,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             } else {
                 // RFC 9293: "<SEQ=SEG.ACK><CTL=RST>" for an unacceptable
                 // ACK in SYN-RECEIVED.
-                fx.reset_reply = Some(ResetReply { seq: ack, ack: None });
+                fx.reset_reply = Some(ResetReply {
+                    seq: ack,
+                    ack: None,
+                });
                 return;
             }
         }
@@ -198,7 +214,8 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         // SACK blocks inform the scoreboard before any dup-ack accounting
         // (RFC 6675 §2 DupAck definition).
         let new_sack = if self.sack_enabled && !opts.sack_blocks.is_empty() {
-            self.scoreboard.ingest(opts.sack_blocks.as_slice(), self.snd_una, self.snd_nxt)
+            self.scoreboard
+                .ingest(opts.sack_blocks.as_slice(), self.snd_una, self.snd_nxt)
         } else {
             false
         };
@@ -226,9 +243,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             self.snd_max_wnd = self.snd_max_wnd.max(new_wnd);
             self.snd_wl1 = seq;
             self.snd_wl2 = ack;
+            // Any acceptable ACK proves the peer alive: reset the persist
+            // abort counter (RFC 1122 §4.2.2.17 — probe indefinitely "as
+            // long as the receiving TCP continues to send acknowledgments";
+            // the cap in `on_timer` is for a silent peer only).
+            self.persist_count = 0;
             if new_wnd > 0 {
-                // Window opened: leave persist mode.
-                self.persist_count = 0;
                 self.probe_pending = false;
             }
         }
@@ -241,11 +261,24 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         }
 
         // ---- Step 8: FIN ----
-        if h.flags.fin() {
+        // Only states that have not yet processed the peer's FIN may record
+        // one; otherwise a forged FIN at the (post-FIN) RCV.NXT would be
+        // re-consumed, drifting RCV.NXT and emitting duplicate `PeerFin`
+        // events (DEF-M1).
+        if h.flags.fin()
+            && matches!(
+                self.state,
+                State::SynReceived | State::Established | State::FinWait1 | State::FinWait2
+            )
+        {
             let fin_seq = seq.add(payload.len() as u32);
             // Only honor a FIN that is inside (or exactly at) the window;
             // one beyond the right edge was trimmed away with its data.
-            if fin_seq == self.rcv_nxt || fin_seq.in_window(self.rcv_nxt, wnd.max(1)) {
+            // Never move an already-recorded FIN backward (an injected
+            // earlier FIN would truncate the legitimate stream).
+            if (fin_seq == self.rcv_nxt || fin_seq.in_window(self.rcv_nxt, wnd.max(1)))
+                && self.peer_fin.is_none_or(|f| fin_seq.le(f))
+            {
                 self.peer_fin = Some(fin_seq);
             }
         }
@@ -259,7 +292,11 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             // (simultaneous-open) one reports refusal. `enter_closed`
             // handles the silent/reported distinction via `self.reported`.
             State::SynReceived => {
-                let reason = if self.passive { CloseReason::Reset } else { CloseReason::Refused };
+                let reason = if self.passive {
+                    CloseReason::Reset
+                } else {
+                    CloseReason::Refused
+                };
                 self.enter_closed(reason, fx);
             }
             State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait => {
@@ -274,8 +311,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     fn process_new_ack(&mut self, now: Instant, ack: SeqNr, fx: &mut Effects) {
         let acked_total = ack.since(self.snd_una);
         let mut acked_data = acked_total;
-        if self.snd_una == self.iss {
-            acked_data -= 1; // our SYN unit
+        if !self.syn_acked {
+            // First new ACK in a synchronized state covers our SYN (it was
+            // at SND.UNA == ISS). Positional `snd_una == iss` would re-fire
+            // after `snd_una` wraps past `iss` (DEF-C3).
+            self.syn_acked = true;
+            acked_data -= 1;
         }
         let fin_acked = match self.fin_seq {
             Some(f) if ack.gt(f) => {
@@ -375,7 +416,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// RFC 9293 §3.10.7.4 step 7: deliver segment text.
     fn process_text(&mut self, now: Instant, seq: SeqNr, payload: &[u8], fx: &mut Effects) {
-        if !matches!(self.state, State::Established | State::FinWait1 | State::FinWait2) {
+        if !matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        ) {
             // "This should not occur ... ignore the segment text"
             // (a FIN was already received from the peer).
             return;
@@ -392,9 +436,15 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         } else {
             (seq.since(self.rcv_nxt), payload)
         };
-        // Right-trim to the window.
-        let wnd = self.recv_buf.window();
-        let room = wnd.saturating_sub(start_off);
+        // Right-trim to the window — and to the peer's FIN if one is
+        // recorded, so RCV.NXT can never step *past* the FIN sequence
+        // (which would leave the FIN forever unconsumed and desync both
+        // sides — DEF-M2). A well-behaved peer never sends data beyond its
+        // FIN; this guards against injected or buggy segments.
+        let mut room = self.recv_buf.window().saturating_sub(start_off);
+        if let Some(f) = self.peer_fin {
+            room = room.min(f.since(self.rcv_nxt).saturating_sub(start_off));
+        }
         let take = (data.len() as u32).min(room) as usize;
         if take == 0 {
             self.set_ack(AckState::Now);
@@ -431,16 +481,24 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// RFC 9293 §3.10.7.4 step 8, deferred until the FIN is in order.
     fn try_consume_fin(&mut self, now: Instant, fx: &mut Effects) {
+        // Only the pre-FIN states consume one; everywhere else the peer's
+        // FIN is already accounted for (DEF-M1).
+        if !matches!(
+            self.state,
+            State::SynReceived | State::Established | State::FinWait1 | State::FinWait2
+        ) {
+            return;
+        }
         let Some(f) = self.peer_fin else { return };
         if f != self.rcv_nxt {
-            return; // data before the FIN still missing (or already eaten)
+            return; // data before the FIN still missing
         }
         self.peer_fin = None;
         self.rcv_nxt = self.rcv_nxt.add(1);
         self.set_ack(AckState::Now);
         fx.event(ConnEvent::PeerFin);
         match self.state {
-            State::Established => self.state = State::CloseWait,
+            State::SynReceived | State::Established => self.state = State::CloseWait,
             // If this same segment also acked our FIN, step 5 already moved
             // us to FIN-WAIT-2, handled below.
             State::FinWait1 => self.state = State::Closing,

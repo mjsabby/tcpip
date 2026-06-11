@@ -129,7 +129,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         }
         if self.probe_pending {
             self.probe_pending = false;
-            if let Some(p) = self.plan_probe() {
+            if let Some(p) = self.plan_probe(now) {
                 return Some(p);
             }
         }
@@ -160,6 +160,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         if self.timers[TimerKind::Rexmit as usize].is_none() {
             self.timers[TimerKind::Rexmit as usize] = Some(now + self.rtt.rto());
         }
+        // RFC 6675: HighRxt covers the fast retransmit. Without this the
+        // very next `plan_sack_rexmit` finds the same hole at SND.UNA and
+        // emits the head segment a second time (DEF-L5).
+        if self.sack_enabled && self.sack_cursor.lt(self.snd_una.add(len.max(1))) {
+            self.sack_cursor = self.snd_una.add(len.max(1));
+        }
         let mut flags = TcpFlags::default();
         if fin_here {
             flags = flags.union(TcpFlags::FIN);
@@ -184,11 +190,17 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     /// SACK-based recovery (RFC 6675-lite): retransmit the next hole below
     /// the highest SACKed sequence while the pipe has room.
     fn plan_sack_rexmit(&mut self, now: Instant) -> Option<SegmentPlan> {
-        let pipe = self.flight_size().saturating_sub(self.scoreboard.sacked_bytes());
+        let pipe = self
+            .flight_size()
+            .saturating_sub(self.scoreboard.sacked_bytes());
         if pipe >= self.cc.cwnd {
             return None;
         }
-        let from = if self.sack_cursor.lt(self.snd_una) { self.snd_una } else { self.sack_cursor };
+        let from = if self.sack_cursor.lt(self.snd_una) {
+            self.snd_una
+        } else {
+            self.sack_cursor
+        };
         let (start, hole_len) = self.scoreboard.next_hole(from)?;
         // The hole may include our FIN's sequence slot; data lives below
         // `data_end`.
@@ -322,22 +334,39 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         })
     }
 
-    /// Zero-window probe (RFC 9293 §3.8.6.1): one byte *beyond* the
-    /// advertised window, without advancing SND.NXT. The peer's
-    /// acceptability test rejects it and answers with the ACK that tells us
-    /// the current window.
-    fn plan_probe(&mut self) -> Option<SegmentPlan> {
-        if self.snd_wnd > 0 || self.unsent() == 0 || self.snd_nxt != self.snd_una {
+    /// Zero-window probe (RFC 9293 §3.8.6.1): one byte at SND.NXT.
+    ///
+    /// SND.NXT *is* advanced (BSD/Linux behavior), so the probe byte is
+    /// genuinely in flight: if the peer's window has reopened in the
+    /// meantime and it accepts the byte, its ACK of `SND.NXT` is honored
+    /// instead of being rejected by the `ack > SND.NXT` check (which would
+    /// permanently wedge both directions — DEF-C4). Retransmission of an
+    /// unanswered probe is the persist timer's job; `plan_head_rexmit`
+    /// resends the same byte without consuming the data-retry budget.
+    fn plan_probe(&mut self, now: Instant) -> Option<SegmentPlan> {
+        if self.snd_wnd > 0 || self.send_buf.is_empty() {
             return None;
         }
+        // First probe advances SND.NXT; subsequent persist fires retransmit
+        // the same byte at SND.UNA (it is the head of the buffer either way).
+        let seq = self.snd_una;
+        if self.snd_nxt == self.snd_una {
+            self.snd_nxt = self.snd_nxt.add(1);
+        }
+        let payload_off = 0;
+        // The persist timer (not Rexmit) drives retransmission of this byte
+        // so a peer that keeps ACKing with window 0 — alive but full — does
+        // not march `rexmit_count` toward `max_data_retries`. A *silent*
+        // peer is bounded by `max_persist_retries` instead (DEF-H1).
+        let _ = now;
         let window = self.advertise_window();
         self.mark_ack_sent();
         Some(SegmentPlan {
-            seq: self.snd_nxt,
+            seq,
             ack: Some(self.rcv_nxt),
             flags: TcpFlags::default(),
             window,
-            payload_off: self.data_sent(),
+            payload_off,
             payload_len: 1,
             syn_opts: None,
             sack_blocks: BoundedVec::new(),

@@ -35,7 +35,13 @@ pub struct Fragments<'a> {
 pub fn fragment_v4(base: Ipv4Emit, payload: &[u8], mtu: u16) -> Result<Fragments<'_>, FragError> {
     let mtu = mtu as usize;
     if HEADER_LEN + payload.len() <= mtu {
-        return Ok(Fragments { base, payload, chunk: payload.len().max(8), at: 0, done: false });
+        return Ok(Fragments {
+            base,
+            payload,
+            chunk: payload.len().max(8),
+            at: 0,
+            done: false,
+        });
     }
     if base.dont_frag {
         return Err(FragError::DontFragment);
@@ -44,7 +50,13 @@ pub fn fragment_v4(base: Ipv4Emit, payload: &[u8], mtu: u16) -> Result<Fragments
     if chunk == 0 {
         return Err(FragError::MtuTooSmall);
     }
-    Ok(Fragments { base, payload, chunk, at: 0, done: false })
+    Ok(Fragments {
+        base,
+        payload,
+        chunk,
+        at: 0,
+        done: false,
+    })
 }
 
 impl<'a> Iterator for Fragments<'a> {
@@ -58,7 +70,14 @@ impl<'a> Iterator for Fragments<'a> {
         let take = remaining.min(self.chunk);
         let last = take == remaining;
         let mut h = self.base;
-        h.frag_offset = self.base.frag_offset + self.at as u16;
+        // Re-fragmenting an already-fragmented datagram (non-zero base
+        // offset) plus a large `at` could exceed 65 528: clamp rather than
+        // wrap so the emitted offset is at least monotone (DEF-L17). This
+        // path has no callers today; the clamp is a guard for future ones.
+        h.frag_offset = self
+            .base
+            .frag_offset
+            .saturating_add(self.at.min(u16::MAX as usize) as u16);
         h.more_frags = self.base.more_frags || !last;
         let part = &self.payload[self.at..self.at + take];
         self.at += take;
@@ -90,7 +109,10 @@ mod tests {
     #[test]
     fn df_blocks_fragmentation() {
         let payload = [9u8; 2000];
-        assert!(matches!(fragment_v4(base(true), &payload, 1500), Err(FragError::DontFragment)));
+        assert!(matches!(
+            fragment_v4(base(true), &payload, 1500),
+            Err(FragError::DontFragment)
+        ));
     }
 
     #[test]

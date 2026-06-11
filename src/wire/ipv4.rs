@@ -175,8 +175,14 @@ mod tests {
     #[test]
     fn emit_parse_round_trip() {
         let mut buf = [0u8; 64];
-        let emit =
-            Ipv4Emit::datagram([10, 0, 0, 1], [10, 0, 0, 2], super::super::proto::TCP, 64, 7, true);
+        let emit = Ipv4Emit::datagram(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            super::super::proto::TCP,
+            64,
+            7,
+            true,
+        );
         let hl = emit.emit(4, &mut buf);
         buf[hl..hl + 4].copy_from_slice(b"abcd");
         let (h, payload) = parse(&buf[..hl + 4]).unwrap();

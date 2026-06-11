@@ -11,10 +11,17 @@ use crate::time::Instant;
 use crate::types::SocketAddr;
 
 /// SipHash-2-4 (Aumasson & Bernstein), the F recommended by RFC 6528.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct SipHash24 {
     k0: u64,
     k1: u64,
+}
+
+impl core::fmt::Debug for SipHash24 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The key is the RFC 6528 secret: never print it (S-ISN-DEBUG).
+        f.write_str("SipHash24 { <redacted> }")
+    }
 }
 
 impl SipHash24 {
@@ -123,6 +130,29 @@ impl IsnGenerator {
         let f = key.hash(&buf[..at]) as u32;
         Some(SeqNr(m.wrapping_add(f)))
     }
+
+    /// Keyed hash of an arbitrary `u64`, for derived per-host secrets that
+    /// must be unpredictable to an off-path attacker but deterministic for
+    /// replay: ephemeral-port offsets (RFC 6056), IPv4 identification fields
+    /// (RFC 7739), and challenge-ACK budget jitter. `domain` separates uses
+    /// so e.g. the port hash cannot be learned from the IP-ID hash.
+    pub fn keyed_hash(&self, domain: u8, value: u64) -> Option<u64> {
+        let key = self.key?;
+        let mut buf = [0u8; 9];
+        buf[0] = domain;
+        buf[1..].copy_from_slice(&value.to_le_bytes());
+        Some(key.hash(&buf))
+    }
+}
+
+/// Domain separators for [`IsnGenerator::keyed_hash`].
+pub mod domain {
+    /// Ephemeral source-port offset (RFC 6056 Algorithm 5).
+    pub const EPHEMERAL_PORT: u8 = 1;
+    /// IPv4 identification field (RFC 7739).
+    pub const IP_IDENT: u8 = 2;
+    /// Challenge-ACK per-second budget jitter (CVE-2016-5696 mitigation).
+    pub const CHALLENGE_ACK: u8 = 3;
 }
 
 #[cfg(test)]
@@ -133,7 +163,10 @@ mod tests {
     /// Reference vectors from the SipHash paper (key 00..0f).
     #[test]
     fn siphash24_reference_vectors() {
-        let key = SipHash24 { k0: 0x0706_0504_0302_0100, k1: 0x0f0e_0d0c_0b0a_0908 };
+        let key = SipHash24 {
+            k0: 0x0706_0504_0302_0100,
+            k1: 0x0f0e_0d0c_0b0a_0908,
+        };
         assert_eq!(key.hash(b""), 0x726f_db47_dd0e_0e31);
         assert_eq!(key.hash(&[0x00]), 0x74f8_39c5_93dc_67fd);
         let msg: [u8; 15] = core::array::from_fn(|i| i as u8);
@@ -154,7 +187,9 @@ mod tests {
         // Deterministic for the same inputs (replay requirement).
         assert_eq!(g.generate(t, sa(1), sa(2)).unwrap(), a);
         // The 4µs clock advances the ISN.
-        let later = g.generate(t + crate::time::Duration::from_micros(40), sa(1), sa(2)).unwrap();
+        let later = g
+            .generate(t + crate::time::Duration::from_micros(40), sa(1), sa(2))
+            .unwrap();
         assert_eq!(later.since(a), 10);
         // A different secret changes everything.
         let mut g2 = IsnGenerator::new();

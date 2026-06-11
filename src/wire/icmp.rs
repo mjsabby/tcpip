@@ -58,9 +58,19 @@ pub struct IcmpMessage {
 }
 
 impl IcmpMessage {
-    /// The MTU carried in a fragmentation-needed / packet-too-big message.
-    pub fn mtu(&self) -> u32 {
+    /// The MTU carried in an ICMPv6 Packet Too Big message (RFC 4443 §3.2:
+    /// full 32-bit field).
+    pub fn mtu_v6(&self) -> u32 {
         u32::from_be_bytes(self.rest)
+    }
+
+    /// The Next-Hop MTU carried in an ICMPv4 Destination Unreachable /
+    /// Fragmentation Needed message (RFC 1191 §4: low 16 bits only; bytes
+    /// 4–5 are "unused"). Reading all 32 bits mis-parses any router that
+    /// leaves garbage in the unused field, silently discarding a legitimate
+    /// PMTU signal (DEF-M7).
+    pub fn mtu_v4(&self) -> u16 {
+        u16::from_be_bytes([self.rest[2], self.rest[3]])
     }
 }
 
@@ -74,7 +84,11 @@ pub fn parse_v4(data: &[u8]) -> Result<(IcmpMessage, &[u8]), WireError> {
         return Err(WireError::BadChecksum);
     }
     Ok((
-        IcmpMessage { kind: data[0], code: data[1], rest: [data[4], data[5], data[6], data[7]] },
+        IcmpMessage {
+            kind: data[0],
+            code: data[1],
+            rest: [data[4], data[5], data[6], data[7]],
+        },
         &data[HEADER_LEN..],
     ))
 }
@@ -95,7 +109,11 @@ pub fn parse_v6<'a>(
         return Err(WireError::BadChecksum);
     }
     Ok((
-        IcmpMessage { kind: data[0], code: data[1], rest: [data[4], data[5], data[6], data[7]] },
+        IcmpMessage {
+            kind: data[0],
+            code: data[1],
+            rest: [data[4], data[5], data[6], data[7]],
+        },
         &data[HEADER_LEN..],
     ))
 }
@@ -201,13 +219,27 @@ mod tests {
         write_u16(&mut l4, 2, 443);
         l4[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes());
         let q = quoted_tcp(&l4).unwrap();
-        assert_eq!(q, QuotedTcp { src_port: 8080, dst_port: 443, seq: 0xdead_beef });
+        assert_eq!(
+            q,
+            QuotedTcp {
+                src_port: 8080,
+                dst_port: 443,
+                seq: 0xdead_beef
+            }
+        );
         assert_eq!(quoted_tcp(&l4[..7]).unwrap_err(), WireError::Truncated);
     }
 
     #[test]
     fn mtu_field() {
-        let m = IcmpMessage { kind: v4::DEST_UNREACHABLE, code: v4::CODE_FRAG_NEEDED, rest: [0, 0, 0x05, 0xdc] };
-        assert_eq!(m.mtu(), 1500);
+        // RFC 1191: bytes 4–5 are unused; only 6–7 carry the MTU. A router
+        // leaving garbage in the unused bytes must still be understood.
+        let m = IcmpMessage {
+            kind: v4::DEST_UNREACHABLE,
+            code: v4::CODE_FRAG_NEEDED,
+            rest: [0xAB, 0xCD, 0x05, 0xdc],
+        };
+        assert_eq!(m.mtu_v4(), 1500);
+        assert_eq!(m.mtu_v6(), 0xABCD_05DC);
     }
 }

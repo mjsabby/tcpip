@@ -161,7 +161,7 @@ impl TunRuntime {
     }
 
     pub fn close(&mut self, sock: SocketId) -> Result<(), Error> {
-        let r = self.stack.close(sock);
+        let r = self.stack.close(self.now(), sock);
         self.drain_actions();
         r
     }

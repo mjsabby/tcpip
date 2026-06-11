@@ -39,6 +39,10 @@ struct Slot {
     total_len: Option<u32>,
     deadline: Instant,
     in_use: bool,
+    /// Bumped on every (re)allocation. Carried in `TimerKey::Reasm` so a
+    /// stale fire from a previous occupant cannot evict the current one
+    /// under a non-compliant runtime (S-GEN-1).
+    generation: u8,
     buf: [u8; REASM_BUF_SIZE],
 }
 
@@ -50,6 +54,7 @@ impl Default for Slot {
             total_len: None,
             deadline: Instant::ZERO,
             in_use: false,
+            generation: 0,
             buf: [0; REASM_BUF_SIZE],
         }
     }
@@ -69,7 +74,9 @@ impl Default for Reassembler {
 impl Reassembler {
     /// An empty reassembler.
     pub fn new() -> Self {
-        Reassembler { slots: [Slot::default(); REASM_SLOTS] }
+        Reassembler {
+            slots: [Slot::default(); REASM_SLOTS],
+        }
     }
 
     /// Offer a fragment. `offset` is in bytes; `more` is the MF flag.
@@ -120,8 +127,7 @@ impl Reassembler {
                 // stored at or beyond `end` therefore shows up as that
                 // hole starting *after* `end` — a conflict with this final
                 // fragment.
-                let unbounded_start =
-                    slot.holes.iter().find(|h| h.1 == u32::MAX).map(|h| h.0);
+                let unbounded_start = slot.holes.iter().find(|h| h.1 == u32::MAX).map(|h| h.0);
                 if unbounded_start.is_none_or(|hs| hs > end) {
                     slot.in_use = false;
                     return ReasmResult::Dropped;
@@ -205,17 +211,37 @@ impl Reassembler {
         }
     }
 
-    /// Copy a completed datagram out and free its slot. Returns the key and
-    /// payload length. `out` must be at least [`REASM_BUF_SIZE`] bytes.
-    pub fn take(&mut self, slot: usize, out: &mut [u8]) -> Option<(ReasmKey, usize)> {
-        let s = &mut self.slots[slot];
-        if !s.in_use || s.total_len.is_none() || !s.holes.is_empty() {
+    /// Borrow a completed datagram in place. The slot stays occupied until
+    /// [`Self::release`] is called, so the borrow is valid across the
+    /// caller's processing without a copy-out — which is the point: the
+    /// previous copy-out put a [`REASM_BUF_SIZE`]-byte array on the call
+    /// stack beneath the deep `deliver → on_segment` chain, risking thread-
+    /// stack overflow on constrained targets (DEF-M6).
+    pub fn completed(&self, slot: usize) -> Option<(ReasmKey, &[u8])> {
+        let s = self.slots.get(slot)?;
+        if !s.in_use || !s.holes.is_empty() {
             return None;
         }
-        let len = s.total_len.unwrap_or(0) as usize;
-        out[..len].copy_from_slice(&s.buf[..len]);
-        s.in_use = false;
-        Some((s.key, len))
+        let len = s.total_len? as usize;
+        Some((s.key, &s.buf[..len]))
+    }
+
+    /// Free a slot after [`Self::completed`] has been consumed.
+    pub fn release(&mut self, slot: usize) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.in_use = false;
+        }
+    }
+
+    /// Copy a completed datagram out and free its slot (test/diagnostic
+    /// convenience; the stack uses [`Self::completed`] + [`Self::release`]).
+    #[cfg(test)]
+    pub fn take(&mut self, slot: usize, out: &mut [u8]) -> Option<(ReasmKey, usize)> {
+        let (key, payload) = self.completed(slot)?;
+        let len = payload.len();
+        out[..len].copy_from_slice(payload);
+        self.release(slot);
+        Some((key, len))
     }
 
     /// Expire a slot whose reassembly timer fired (RFC 791 §3.2: discard on
@@ -230,6 +256,11 @@ impl Reassembler {
     pub fn deadline(&self, slot: usize) -> Option<Instant> {
         let s = self.slots.get(slot)?;
         s.in_use.then_some(s.deadline)
+    }
+
+    /// Current occupant's generation for `slot` (stale-timer filtering).
+    pub fn generation(&self, slot: usize) -> u8 {
+        self.slots.get(slot).map(|s| s.generation).unwrap_or(0)
     }
 
     fn drop_key(&mut self, key: &ReasmKey) {
@@ -254,15 +285,19 @@ impl Reassembler {
                 s.key = *key;
                 s.deadline = now + timeout;
                 s.in_use = true;
+                s.generation = s.generation.wrapping_add(1);
                 s.total_len = None;
                 s.holes.clear();
                 let _ = s.holes.push((0, u32::MAX));
                 return Some(i);
             }
         }
-        // Table full: drop the *new* datagram, keep older ones (favors
-        // completing in-progress work; an attacker gains nothing by
-        // flooding since slots are time-bounded).
+        // Table full: drop the *new* datagram, keep older ones. With only
+        // [`REASM_SLOTS`] slots an attacker can pin all of them with
+        // never-completing datagrams for one `reassembly_timeout`, denying
+        // fragmented ingress for that window — an accepted residual: this
+        // stack's own TCP always sets DF, so only inbound fragmented
+        // ICMP/peer traffic is affected (L-POOL-1; see `StackStats`).
         None
     }
 }
@@ -288,7 +323,11 @@ mod tests {
     fn in_order_and_reverse_reassembly() {
         for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
             let mut r = Reassembler::new();
-            let frags = [(0u32, true, [1u8; 16]), (16, true, [2u8; 16]), (32, false, [3u8; 16])];
+            let frags = [
+                (0u32, true, [1u8; 16]),
+                (16, true, [2u8; 16]),
+                (32, false, [3u8; 16]),
+            ];
             let mut done = None;
             for &i in &order {
                 let (off, more, ref data) = frags[i];
@@ -311,22 +350,40 @@ mod tests {
     #[test]
     fn exact_duplicate_tolerated_conflict_dropped() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(T0, TMO, key(1), 0, true, &[7; 16]), ReasmResult::Pending);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 0, true, &[7; 16]),
+            ReasmResult::Pending
+        );
         // Exact duplicate: benign.
-        assert_eq!(r.push(T0, TMO, key(1), 0, true, &[7; 16]), ReasmResult::Pending);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 0, true, &[7; 16]),
+            ReasmResult::Pending
+        );
         // Same range, different bytes: hostile, datagram dropped.
-        assert_eq!(r.push(T0, TMO, key(1), 0, true, &[8; 16]), ReasmResult::Dropped);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 0, true, &[8; 16]),
+            ReasmResult::Dropped
+        );
         // Reassembly state is gone; a fresh final fragment alone completes
         // nothing.
-        assert_eq!(r.push(T0, TMO, key(1), 16, false, &[9; 8]), ReasmResult::Pending);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 16, false, &[9; 8]),
+            ReasmResult::Pending
+        );
     }
 
     #[test]
     fn partial_overlap_drops_datagram() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(T0, TMO, key(1), 8, true, &[1; 16]), ReasmResult::Pending);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 8, true, &[1; 16]),
+            ReasmResult::Pending
+        );
         // Overlaps [8,24) partially.
-        assert_eq!(r.push(T0, TMO, key(1), 0, true, &[2; 16]), ReasmResult::Dropped);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 0, true, &[2; 16]),
+            ReasmResult::Dropped
+        );
     }
 
     #[test]
@@ -338,7 +395,10 @@ mod tests {
             ReasmResult::Dropped
         );
         // Non-final fragment not a multiple of 8.
-        assert_eq!(r.push(T0, TMO, key(2), 0, true, &[0; 12]), ReasmResult::Dropped);
+        assert_eq!(
+            r.push(T0, TMO, key(2), 0, true, &[0; 12]),
+            ReasmResult::Dropped
+        );
     }
 
     #[test]
@@ -356,9 +416,15 @@ mod tests {
     fn slot_exhaustion_drops_new() {
         let mut r = Reassembler::new();
         for i in 0..REASM_SLOTS as u32 {
-            assert_eq!(r.push(T0, TMO, key(i), 0, true, &[0; 8]), ReasmResult::Pending);
+            assert_eq!(
+                r.push(T0, TMO, key(i), 0, true, &[0; 8]),
+                ReasmResult::Pending
+            );
         }
-        assert_eq!(r.push(T0, TMO, key(99), 0, true, &[0; 8]), ReasmResult::Dropped);
+        assert_eq!(
+            r.push(T0, TMO, key(99), 0, true, &[0; 8]),
+            ReasmResult::Dropped
+        );
         // But expired slots are reclaimed lazily (offset 0 + !MF is a
         // complete single-fragment datagram, hence Complete).
         let later = T0 + TMO + Duration::from_secs(1);
@@ -371,7 +437,13 @@ mod tests {
     #[test]
     fn conflicting_final_fragments_drop() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(T0, TMO, key(1), 32, false, &[1; 8]), ReasmResult::Pending);
-        assert_eq!(r.push(T0, TMO, key(1), 48, false, &[1; 8]), ReasmResult::Dropped);
+        assert_eq!(
+            r.push(T0, TMO, key(1), 32, false, &[1; 8]),
+            ReasmResult::Pending
+        );
+        assert_eq!(
+            r.push(T0, TMO, key(1), 48, false, &[1; 8]),
+            ReasmResult::Dropped
+        );
     }
 }

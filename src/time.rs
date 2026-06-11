@@ -30,13 +30,17 @@ impl Instant {
     /// Construct from milliseconds since the runtime epoch.
     #[inline]
     pub const fn from_millis(millis: u64) -> Self {
-        Instant { micros: millis * 1_000 }
+        Instant {
+            micros: millis * 1_000,
+        }
     }
 
     /// Construct from seconds since the runtime epoch.
     #[inline]
     pub const fn from_secs(secs: u64) -> Self {
-        Instant { micros: secs * 1_000_000 }
+        Instant {
+            micros: secs * 1_000_000,
+        }
     }
 
     /// Microseconds since the runtime epoch.
@@ -48,7 +52,9 @@ impl Instant {
     /// Time elapsed since `earlier`, saturating to zero if `earlier` is later.
     #[inline]
     pub const fn saturating_since(self, earlier: Instant) -> Duration {
-        Duration { micros: self.micros.saturating_sub(earlier.micros) }
+        Duration {
+            micros: self.micros.saturating_sub(earlier.micros),
+        }
     }
 }
 
@@ -71,13 +77,17 @@ impl Duration {
     /// Construct from milliseconds.
     #[inline]
     pub const fn from_millis(millis: u64) -> Self {
-        Duration { micros: millis * 1_000 }
+        Duration {
+            micros: millis * 1_000,
+        }
     }
 
     /// Construct from seconds.
     #[inline]
     pub const fn from_secs(secs: u64) -> Self {
-        Duration { micros: secs * 1_000_000 }
+        Duration {
+            micros: secs * 1_000_000,
+        }
     }
 
     /// Total microseconds.
@@ -95,25 +105,39 @@ impl Duration {
     /// Saturating multiplication by an integer factor.
     #[inline]
     pub const fn saturating_mul(self, rhs: u32) -> Duration {
-        Duration { micros: self.micros.saturating_mul(rhs as u64) }
+        Duration {
+            micros: self.micros.saturating_mul(rhs as u64),
+        }
     }
 
-    /// Integer division.
+    /// Integer division. Division by zero returns `self` (saturating-style:
+    /// the only callers pass small literal divisors, but a future caller
+    /// passing 0 must not panic in a `panic = abort` deployment).
     #[inline]
     pub const fn div(self, rhs: u32) -> Duration {
-        Duration { micros: self.micros / rhs as u64 }
+        if rhs == 0 {
+            self
+        } else {
+            Duration {
+                micros: self.micros / rhs as u64,
+            }
+        }
     }
 
     /// Saturating addition.
     #[inline]
     pub const fn saturating_add(self, rhs: Duration) -> Duration {
-        Duration { micros: self.micros.saturating_add(rhs.micros) }
+        Duration {
+            micros: self.micros.saturating_add(rhs.micros),
+        }
     }
 
     /// Saturating subtraction.
     #[inline]
     pub const fn saturating_sub(self, rhs: Duration) -> Duration {
-        Duration { micros: self.micros.saturating_sub(rhs.micros) }
+        Duration {
+            micros: self.micros.saturating_sub(rhs.micros),
+        }
     }
 
     /// The larger of two durations.
@@ -139,7 +163,9 @@ impl Add<Duration> for Instant {
     type Output = Instant;
     #[inline]
     fn add(self, rhs: Duration) -> Instant {
-        Instant { micros: self.micros.saturating_add(rhs.micros) }
+        Instant {
+            micros: self.micros.saturating_add(rhs.micros),
+        }
     }
 }
 
@@ -180,6 +206,9 @@ mod tests {
         assert_eq!((t0 - t1), Duration::ZERO); // saturating
         assert_eq!(Duration::from_secs(1).saturating_mul(2).as_millis(), 2000);
         let d = Duration::from_millis(500);
-        assert_eq!(d.clamp(Duration::from_secs(1), Duration::from_secs(60)), Duration::from_secs(1));
+        assert_eq!(
+            d.clamp(Duration::from_secs(1), Duration::from_secs(60)),
+            Duration::from_secs(1)
+        );
     }
 }
