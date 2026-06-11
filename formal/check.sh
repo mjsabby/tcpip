@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Model-check the TCP FSM with TLC.
+# Model-check the TCP FSM and the stack<->runtime timer boundary with TLC.
 #
 # Requires Java and tla2tools.jar. Set TLA_TOOLS to its path, or drop
 # tla2tools.jar next to this script. Download:
@@ -19,4 +19,33 @@ if [[ ! -f "$JAR" ]]; then
   exit 1
 fi
 
-exec java -XX:+UseParallelGC -jar "$JAR" -config tcp_fsm.cfg tcp_fsm.tla
+tlc() { java -XX:+UseParallelGC -jar "$JAR" "$@"; }
+
+echo "== tcp_fsm: connection FSM (safety + liveness) =="
+tlc -config tcp_fsm.cfg tcp_fsm.tla
+
+echo
+echo "== runtime_boundary: timer reconcile protocol (fixed) =="
+# Quiescence (no enabled action) is the goal state here, not a deadlock.
+tlc -deadlock -config runtime_boundary.cfg runtime_boundary.tla
+
+echo
+echo "== runtime_boundary: pre-fix protocol must STILL fail (negative test) =="
+# The RecordOnShed=TRUE variant models the bug fixed in src/stack.rs
+# (recording a timer diff as delivered when the queue shed it). TLC must
+# find the QuiescentFaithful violation; if it stops finding it, the model
+# no longer captures the bug class and needs attention.
+if tlc -deadlock -config runtime_boundary_bug.cfg runtime_boundary.tla \
+    > /tmp/runtime_boundary_bug.out 2>&1; then
+  echo "ERROR: pre-fix model unexpectedly verified — counterexample vanished" >&2
+  exit 1
+fi
+if ! grep -q "Invariant QuiescentFaithful is violated" /tmp/runtime_boundary_bug.out; then
+  echo "ERROR: pre-fix model failed for the wrong reason:" >&2
+  tail -20 /tmp/runtime_boundary_bug.out >&2
+  exit 1
+fi
+echo "counterexample found, as expected (see /tmp/runtime_boundary_bug.out)"
+
+echo
+echo "ALL MODEL CHECKS PASSED"

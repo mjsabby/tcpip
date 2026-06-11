@@ -109,4 +109,47 @@ mod tests {
         let a = SeqNr(1000);
         assert!(a.le(a) && a.ge(a) && !a.lt(a) && !a.gt(a));
     }
+
+    /// Cross-check against the characterizations proved in Coq
+    /// (`formal/seq_arith.v`): lt ⟺ forward distance in [1, 2³¹−1];
+    /// le ⟺ distance ≤ 2³¹ (antipode included); `since` IS the forward
+    /// distance; `in_window` compares it to the length; add/since
+    /// round-trips. Exhaustive over a lattice of wraparound/antipode
+    /// boundary values, so the hand-mirrored Coq definitions and this code
+    /// cannot drift apart silently at the values where they could disagree.
+    #[test]
+    fn coq_characterizations_hold_on_boundary_lattice() {
+        const HW: u64 = 1 << 31;
+        const W: u64 = 1 << 32;
+        let pts = [
+            0u32,
+            1,
+            2,
+            0x7FFF_FFFE,
+            0x7FFF_FFFF, // HW - 1
+            0x8000_0000, // HW (the antipode distance pivot)
+            0x8000_0001,
+            0xFFFF_FFFE,
+            0xFFFF_FFFF,
+            12_345,
+            0xDEAD_BEEF,
+        ];
+        for &a in &pts {
+            for &b in &pts {
+                let (sa, sb) = (SeqNr(a), SeqNr(b));
+                let d = (u64::from(b) + W - u64::from(a)) % W; // forward distance
+                assert_eq!(sa.lt(sb), (1..HW).contains(&d), "ltb_charact {a:#x} {b:#x}");
+                assert_eq!(sa.le(sb), d <= HW, "leb_charact {a:#x} {b:#x}");
+                assert_eq!(u64::from(sb.since(sa)), d, "since is the distance");
+                assert_eq!(sa.add(sb.since(sa)), sb, "since_add round-trip");
+                for len in [0u32, 1, 5, u32::MAX] {
+                    assert_eq!(
+                        sb.in_window(sa, len),
+                        d < u64::from(len),
+                        "in_window_spec {a:#x} {b:#x} {len}"
+                    );
+                }
+            }
+        }
+    }
 }

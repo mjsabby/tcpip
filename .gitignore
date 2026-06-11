@@ -4,3 +4,11 @@ target/
 # TLC model-checker scratch state
 formal/states/
 formal/*.out
+
+# Coq build artifacts
+formal/*.vo
+formal/*.vos
+formal/*.vok
+formal/*.glob
+formal/.*.aux
+formal/.lia.cache
