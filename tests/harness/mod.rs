@@ -14,10 +14,34 @@ use std::collections::BTreeMap;
 use std::vec::Vec;
 use tcp_sans_io::config::Config;
 use tcp_sans_io::time::{Duration, Instant};
-use tcp_sans_io::{Action, AppEvent, CloseReason, Event, IpAddr, SocketAddr, SocketId, Stack, TimerKey};
+use tcp_sans_io::{
+    Action, AppEvent, CloseReason, Event, IpAddr, SocketAddr, SocketId, Stack, TimerKey, TimerKind,
+};
 
 /// Maximum datagram the harness will carry (one MTU of headroom).
 pub const FRAME: usize = 2048;
+
+/// Upper bound on `poll_action` calls in one drain. Statically, a quiescing
+/// stack can owe at most the action queue (64) + ctl queue (8) + one echo +
+/// every connection's sendable window (≈ 16 KiB / MSS ≈ 12 segments × 8
+/// conns) + a sweep's worth of timer diffs — well under 1k. A drain that
+/// exceeds this bound means `poll_action` is not quiescing: a livelock.
+pub const DRAIN_FUEL: usize = 8192;
+
+/// How faithfully the harness honors the A-POLL-1 drain obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainPolicy {
+    /// Drain to `None` after every event/API call (a compliant runtime).
+    Eager,
+    /// Skip each drain opportunity with probability `skip_permille`,
+    /// seed-driven — a runtime that falls behind and catches up later.
+    /// Models GC pauses, batching hosts, starved threads. The stack's
+    /// degraded-mode claim ("delays, never loses") is tested in this mode.
+    Lazy {
+        /// Probability per mille of skipping a drain opportunity.
+        skip_permille: u32,
+    },
+}
 
 /// A datagram in flight, scheduled to arrive at `deliver_at`.
 struct InFlight {
@@ -138,6 +162,8 @@ pub struct Net {
     pub events: Vec<Captured>,
     /// Total bytes the harness chose to drop (for assertions/logging).
     pub dropped: u64,
+    /// Drain discipline (default: compliant `Eager`).
+    pub drain_policy: DrainPolicy,
 }
 
 impl Net {
@@ -175,6 +201,7 @@ impl Net {
             seq: 0,
             events: Vec::new(),
             dropped: 0,
+            drain_policy: DrainPolicy::Eager,
         };
         // Seed entropy on both stacks and clear the resulting actions.
         net.pump();
@@ -226,12 +253,31 @@ impl Net {
         }
     }
 
+    /// Drain `host` honoring the configured policy: a lazy runtime skips
+    /// this opportunity (seed-driven) and catches up at a later drain.
+    fn maybe_drain(&mut self, host: Host) {
+        match self.drain_policy {
+            DrainPolicy::Eager => self.drain(host),
+            DrainPolicy::Lazy { skip_permille } => {
+                if !self.rng.chance_permille(skip_permille) {
+                    self.drain(host);
+                }
+            }
+        }
+    }
+
     fn drain(&mut self, host: Host) {
         let now = self.clock;
         let mut tx = [0u8; FRAME];
+        let mut fuel = DRAIN_FUEL;
         loop {
             let action = self.stack(host).poll_action(now, &mut tx);
             let Some(action) = action else { break };
+            // Anti-livelock: a quiescing stack owes a statically bounded
+            // amount of work; burning all fuel means poll_action will yield
+            // actions forever (e.g. an ACK/retransmit generation loop).
+            fuel -= 1;
+            assert!(fuel > 0, "poll_action did not quiesce within {DRAIN_FUEL} actions: livelock");
             match action {
                 Action::None => {}
                 Action::RequestEntropy => {
@@ -340,7 +386,7 @@ impl Net {
         for (host, key) in due {
             let now = self.clock;
             self.stack(host).on_timer(now, key);
-            self.drain(host);
+            self.maybe_drain(host);
         }
 
         // Deliver all datagrams due now, in (deliver_at, seq) order.
@@ -359,7 +405,7 @@ impl Net {
         for (to, bytes) in delivered {
             let now = self.clock;
             self.stack(to).on_datagram(now, &bytes);
-            self.drain(to);
+            self.maybe_drain(to);
         }
         true
     }
@@ -394,19 +440,19 @@ impl Net {
 
     pub fn listen(&mut self, host: Host, port: u16) {
         self.stack(host).listen(port).expect("listen");
-        self.drain(host);
+        self.maybe_drain(host);
     }
 
     pub fn connect(&mut self, host: Host, to: SocketAddr) -> SocketId {
         let now = self.clock;
         let id = self.stack(host).connect(now, to).expect("connect");
-        self.drain(host);
+        self.maybe_drain(host);
         id
     }
 
     pub fn send(&mut self, host: Host, sock: SocketId, data: &[u8]) -> usize {
         let n = self.stack(host).send(sock, data).expect("send");
-        self.drain(host);
+        self.maybe_drain(host);
         n
     }
 
@@ -414,14 +460,14 @@ impl Net {
     /// under heavy loss). Used by the fuzzer where teardown is expected.
     pub fn try_send(&mut self, host: Host, sock: SocketId, data: &[u8]) -> Option<usize> {
         let r = self.stack(host).send(sock, data).ok();
-        self.drain(host);
+        self.maybe_drain(host);
         r
     }
 
     /// Fallible recv: `None` if the socket is gone, else bytes read.
     pub fn try_recv(&mut self, host: Host, sock: SocketId, out: &mut [u8]) -> Option<usize> {
         let r = self.stack(host).recv(sock, out).ok();
-        self.drain(host);
+        self.maybe_drain(host);
         r
     }
 
@@ -435,12 +481,12 @@ impl Net {
 
     pub fn close(&mut self, host: Host, sock: SocketId) {
         self.stack(host).close(sock).expect("close");
-        self.drain(host);
+        self.maybe_drain(host);
     }
 
     pub fn recv(&mut self, host: Host, sock: SocketId, out: &mut [u8]) -> usize {
         let n = self.stack(host).recv(sock, out).unwrap_or(0);
-        self.drain(host);
+        self.maybe_drain(host);
         n
     }
 
@@ -455,8 +501,49 @@ impl Net {
             }
             out.extend_from_slice(&buf[..n]);
         }
-        self.drain(host);
+        self.maybe_drain(host);
         out
+    }
+
+    // --- Liveness oracles ---
+
+    /// Two-sided timer-fidelity oracle. Force-drains `host` to quiescence,
+    /// then asserts that the timers this harness has armed for `sock` are
+    /// exactly the deadlines the stack currently wants. Any divergence is a
+    /// boundary bug: a lost, phantom, or mis-keyed Start/CancelTimer. A
+    /// wedged connection ("owes the network work but nothing scheduled to
+    /// wake it") shows up here as desired-without-armed.
+    pub fn assert_timer_fidelity(&mut self, host: Host, sock: SocketId) {
+        self.drain(host); // quiesce: after this, emitted == desired
+        const KINDS: [TimerKind; 4] =
+            [TimerKind::Rexmit, TimerKind::Persist, TimerKind::DelAck, TimerKind::Wait];
+        let desired = self.host(host).timer_deadlines_of(sock);
+        for (i, kind) in KINDS.into_iter().enumerate() {
+            let key = TimerKey::Conn { sock, kind };
+            let armed = self
+                .timers
+                .iter()
+                .find(|t| t.live && t.host == host && t.key == key)
+                .map(|t| t.fire_at);
+            let want = desired.and_then(|d| d[i]);
+            match (want, armed) {
+                (None, None) => {}
+                (Some(w), Some(a)) => {
+                    // A deadline already past when a (lazy) drain delivered
+                    // it gets armed at the drain instant — between the
+                    // deadline and the current clock.
+                    assert!(
+                        a == w || (w <= self.clock && a >= w && a <= self.clock),
+                        "{host:?}/{kind:?}: armed {a:?} but stack wants {w:?} (clock {:?})",
+                        self.clock
+                    );
+                }
+                (want, armed) => panic!(
+                    "{host:?}/{kind:?}: stack wants {want:?} but runtime armed {armed:?} — \
+                     lost or phantom timer (boundary bug)"
+                ),
+            }
+        }
     }
 
     // --- Event queries ---

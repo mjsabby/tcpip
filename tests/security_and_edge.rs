@@ -305,3 +305,46 @@ fn checksum_is_verified_on_ingress() {
     let _ = Checksum::new(); // keep the import meaningful
     let _ = Instant::ZERO;
 }
+
+#[test]
+fn syn_flood_fills_pool_sheds_silently_and_recovers() {
+    // Resource exhaustion, end to end: "the conns array IS the pool", so a
+    // SYN flood can pin at most CONNS slots and nothing else — no
+    // allocation, no RST storm (no amplification), no panic. Half-open
+    // slots burn their SYN-ACK retry budget (max_syn_retries), expire, and
+    // the pool serves legitimate clients again.
+    let mut net = clean();
+    net.listen(Host::B, PORT);
+    let b = net.endpoint(Host::B, PORT);
+
+    // Eight spoofed sources fill every Stack<8> slot with SYN-RECEIVED.
+    for i in 0..8u16 {
+        let src = SocketAddr::new(IpAddr::v4(10, 0, 0, 100), 40_000 + i);
+        let syn = forge_v4(src, b, 1_000 + u32::from(i), 0, TcpFlags::SYN, 1000, &[]);
+        let now = net.now();
+        net.b.on_datagram(now, &syn);
+        net.pump_public();
+    }
+    let tx_full = net.b.stats().tx_datagrams;
+    assert!(tx_full >= 8, "a SYN-ACK per accepted SYN ({tx_full})");
+
+    // The ninth SYN is shed in silence: no slot, no SYN-ACK, and
+    // deliberately no RST (the flood gets zero amplification back).
+    let rst_before = net.b.stats().rst_tx;
+    let src9 = SocketAddr::new(IpAddr::v4(10, 0, 0, 100), 40_900);
+    let syn9 = forge_v4(src9, b, 99, 0, TcpFlags::SYN, 1000, &[]);
+    let now = net.now();
+    net.b.on_datagram(now, &syn9);
+    net.pump_public();
+    assert_eq!(net.b.stats().tx_datagrams, tx_full, "shed SYN elicited a reply");
+    assert_eq!(net.b.stats().rst_tx, rst_before, "shed SYN must not RST");
+
+    // Burn the SYN-ACK retransmit budget; the half-opens abort and free
+    // their slots (bounded lifetime — the flood cannot pin slots forever).
+    net.idle(Duration::from_secs(300));
+
+    // Recovery: a real handshake now completes.
+    let client = net.connect(Host::A, b);
+    net.run(200);
+    assert_eq!(net.state_a(client), Some(TcpState::Established), "pool recovered after flood");
+}
