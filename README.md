@@ -95,6 +95,91 @@ The runtime contract is spelled out on `Stack` and in
 clock, and a lossy wire — lives in [`tests/harness/`](tests/harness/mod.rs);
 it is the clearest example of how to embed the core.
 
+## The runtime contract, honestly
+
+The embedding API is deliberately **pull-based**: no callback traits to
+implement, no scheduler to integrate with — you call in, then drain. The
+price is a small set of obligations the compiler cannot enforce. Here is
+each one, and what actually happens if you get it wrong:
+
+| Obligation | What you must do | If you get it wrong |
+|---|---|---|
+| **Drain after every call** (`A-POLL-1`) | Loop `poll_action` to `None` after every event or API call. | **Self-healing.** `poll_action` is level-triggered: it re-derives pending work (segments, timer diffs) from connection state, so a missed drain *delays* output until the next drain — nothing is lost. The only fatal form is a runtime that stops calling it altogether: retransmissions and closes stall. |
+| **Timer fidelity** (`A-POLL-1`) | Keep one deadline per `TimerKey`; `StartTimer` for a live key **replaces** it; after a `CancelTimer` or a replacing `StartTimer`, the old expiry must not be delivered. | A **late** fire is safe (retransmit happens late). A **stale** fire — an old expiry delivered after a re-arm/cancel, the classic race in threaded timer wheels — is trusted and acted on; worst case the `Wait` timer tears down TIME-WAIT early. A single-threaded map like the harness's (`insert` replaces, `remove` cancels) is correct by construction. |
+| **Monotonic time** (`A-TIME-1`) | `now` never decreases across calls. Use a monotonic source (elapsed-since-start), never wall clock. | Backwards time corrupts RTT/RTO arithmetic and timer scheduling. There is no internal defense; this is the one assumption taken entirely on faith. |
+| **Real entropy** (`A-ENTROPY-1`) | Answer `Action::RequestEntropy` with 16 bytes an off-path attacker can't predict (`/dev/urandom`, hardware TRNG). | *Forgetting* is loud: `connect` returns `Error::NeedEntropy`, inbound SYNs are dropped — nothing works until you answer. *Weak bytes* are silent and serious: ISNs become predictable (RFC 6528 falls apart). For deterministic replay, record and replay the seed. |
+| **One-MTU buffer** (`A-MTU-1`) | `tx` passed to `poll_action` holds at least `config().mtu` bytes. | `debug_assert` in debug builds; an out-of-bounds panic when a large datagram is serialized in release. Size it once (`[u8; 2048]` covers the 1500 default) and forget it. |
+
+What you *cannot* get wrong, by construction:
+
+* **Stale handles.** `SocketId` carries a generation counter; a handle kept
+  past `AppEvent::Closed` is rejected (`Error::NotFound`), never aliased to a
+  recycled slot. Timers for recycled slots are dropped the same way.
+* **Queue overflow.** Every internal queue is bounded and sheds rather than
+  grows. Shed timer actions leave the emitted/desired diff in place and are
+  re-issued by the next reconcile (regression-tested:
+  `stack::tests::timer_action_shed_on_full_queue_is_retried`); shed app
+  events are recoverable because **events are notifications, state is the
+  truth** — `recv` answers `Readable`, `state_of` answers
+  `Connected`/`Closed`. Shedding is observable as `StackStats::actions_shed`,
+  and is reachable only under an `A-POLL-1` backlog — a compliant runtime
+  should assert it stays 0.
+* **Re-entrancy.** There are no callbacks, so there is no "called back into
+  the stack while it was borrowed" failure mode, and no action can fire at a
+  moment your runtime isn't ready for it — you choose when to pull, which is
+  also where backpressure comes from: a full NIC ring just means you stop
+  polling, and unsent segments remain state, not buffered copies.
+
+## Worked example: download a web page
+
+[`tools/tun-harness/src/bin/fetch.rs`](tools/tun-harness/src/bin/fetch.rs)
+fetches `http://www.bing.com/` from the real Internet with the sans-I/O stack
+doing **all** of the TCP — SYN, ISN randomization, window management,
+retransmission, FIN. The kernel is demoted to plumbing: it routes raw IP
+datagrams (TUN device + NAT) and resolves the host name.
+
+```sh
+sudo tools/tun-harness/fetch.sh                # GET http://www.bing.com/
+sudo tools/tun-harness/fetch.sh example.com    # any other host
+```
+
+The embedding is the `TunRuntime` from the interop harness (wall clock, real
+timers, `/dev/urandom`, TUN as the wire); the application on top is ~60 lines:
+
+```rust
+let stack: Stack<16> = Stack::new(Config::with_addr(IpAddr::V4(STACK_IP)));
+let mut rt = TunRuntime::new(stack, tun)?;
+rt.poll();                                   // answers Action::RequestEntropy
+
+let sock = rt.connect(SocketAddr::new(IpAddr::V4(remote_ip), 80))?;
+let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+let (mut sent, mut response, mut established, mut peer_fin) = (0, Vec::new(), false, false);
+loop {
+    rt.poll();                               // timers → stack, datagrams → stack, actions → wire
+    for ev in rt.take_events() {
+        match ev {
+            AppEvent::Connected { .. }       => established = true,
+            AppEvent::PeerFinReceived { .. } => peer_fin = true,
+            AppEvent::Closed { .. }          => return Ok(response), // done
+            _ => {}
+        }
+    }
+    if !established { continue; }
+    if sent < request.len()                  // push as buffer space allows
+        && let Ok(n) = rt.send(sock, &request.as_bytes()[sent..]) { sent += n; }
+    while let Ok(n) = rt.recv(sock, &mut buf) {        // drain arrivals
+        if n == 0 { break; }
+        response.extend_from_slice(&buf[..n]);
+    }
+    if peer_fin { let _ = rt.close(sock); }  // server hit EOF: finish the close
+}
+```
+
+The example lives in the harness crate rather than `examples/` because
+opening a TUN device needs one `ioctl` (`unsafe`), and this package forbids
+unsafe code package-wide — tests and examples included.
+
 ## Standards implemented
 
 | RFC | Title | Status |
@@ -128,13 +213,27 @@ this is the honest current state:
   property** (received bytes are always an exact prefix of sent bytes) on
   *every* delivery, and **liveness** (all flows converge once impairment
   stops). Any failure reproduces from its seed alone.
+  The harness also fuzzes the **runtime contract itself**: hostile-runtime
+  lanes skip 50–70 % of their `poll_action` drains (`DrainPolicy::Lazy`),
+  and assert that every connection surviving the backlog converges once the
+  runtime recovers — "alive but never completes" (the wedge) fails the run.
+  Three standing oracles run throughout: a **two-sided timer-fidelity
+  check** (the harness's armed timers must exactly equal
+  `Stack::timer_deadlines_of` at every quiescence — a lost `StartTimer` is
+  a future stall, a phantom one is a leak), a **drain fuel bound**
+  (`poll_action` must quiesce within a static budget — anti-livelock), and
+  `actions_shed == 0` under compliant drains (the action queue is deep
+  enough by construction; observed peak ≤ 3 of 64 even under abuse).
 * **Scenario & security suites.**
   [`tests/scenarios.rs`](tests/scenarios.rs) and
   [`tests/security_and_edge.rs`](tests/security_and_edge.rs) cover the
   Definition-of-Done feature list: handshake, bulk transfer, all close paths,
   TIME-WAIT, retransmission under 30 % loss, SACK recovery, window scaling,
   zero-window persist, PMTUD, ICMP echo, fragment reassembly, RFC 5961
-  blind-attack mitigation, ISN unpredictability, and checksum rejection.
+  blind-attack mitigation, ISN unpredictability, checksum rejection, and
+  **pool exhaustion**: a SYN flood pins at most `CONNS` slots, excess SYNs
+  are shed with zero amplification (no SYN-ACK, no RST), half-opens expire
+  on the retry budget, and service recovers.
 * **Internal invariants (executable).** `Connection::check_invariants`
   (S-INV-1..5) runs in debug builds after every input and every emitted
   segment; the receive buffer and SACK scoreboard self-check too.
@@ -156,8 +255,26 @@ this is the honest current state:
 * **Model checking (TLC).** [`formal/tcp_fsm.tla`](formal/tcp_fsm.tla) models
   the connection FSM; `formal/check.sh` runs TLC over the full state space
   with *no error* for the safety invariant and two liveness properties.
-* **Theorem proving (not started).** The invariants and `seq.rs` are written
-  to port to Coq/Dafny/SPARK; see TRACEABILITY §7.
+  [`formal/runtime_boundary.tla`](formal/runtime_boundary.tla) models the
+  stack↔runtime **timer reconcile protocol** (desired/emitted/queue/armed):
+  TLC proves the shipped retry-on-shed protocol keeps the runtime's view
+  faithful and convergent over the full state space — and, as a negative
+  test, `check.sh` asserts TLC still finds the 5-state stall counterexample
+  for the pre-fix protocol (record-on-shed), so the model can't rot.
+* **Theorem proving (Coq, `seq.rs` done).**
+  [`formal/seq_arith.v`](formal/seq_arith.v) (49 theorems, zero
+  axioms/admits, Coq 8.20) proves the sequence-number arithmetic everything
+  else stands on. Each definition mirrors `src/tcp/seq.rs`
+  formula-for-formula — the `(b - a) as i32 > 0` comparison trick is
+  modeled as a two's-complement reinterpretation and **characterized by
+  theorem** (lt ⟺ forward distance in `[1, 2³¹−1]`), not assumed. Headline
+  results: order laws under the half-space precondition (with the exact
+  2³¹-antipode anomaly stated, not hidden), the add/since round-trip
+  algebra, and spec-equivalences — `in_window_spec` (the O(1) window test
+  accepts exactly the RFC 9293 set) and `ack_acceptance` (`SND.UNA <
+  SEG.ACK ≤ SND.NXT` accepts exactly the in-flight bytes). Run
+  `formal/prove.sh`. Remaining: the §3 invariants and buffer index math
+  (TRACEABILITY §7).
 
 ```sh
 cargo test                       # unit + scenario + security + scripted + fuzz
@@ -166,7 +283,9 @@ cargo build --release            # panic=abort, LTO, codegen-units=1
 cargo build --lib --target thumbv7em-none-eabihf   # proves no_std / bare-metal
 cargo build --features std       # opt-in std (Error trait, TUN runtime)
 ( cd formal && ./check.sh )      # TLC model check (needs Java + tla2tools.jar)
+( cd formal && ./prove.sh )      # Coq proofs for seq.rs (needs coqc)
 sudo tools/tun-harness/run.sh    # live interop vs the Linux kernel (needs root)
+sudo tools/tun-harness/fetch.sh  # worked example: fetch bing.com through the stack
 ```
 
 ## Cargo features
@@ -197,8 +316,10 @@ From PLAN.md, with honest annotations:
 
 The one remaining gap to a certifiable release candidate is interop coverage
 against FreeBSD and Windows (the harness is host-agnostic; it just needs to be
-run on those kernels) and the Layer-2 theorem-proving effort. Linux interop,
-model checking, and the full test stack are done and reproducible above.
+run on those kernels) and finishing the Layer-2 theorem-proving effort
+(`seq.rs` is proved in Coq; the connection invariants and buffer index math
+remain). Linux interop, model checking, and the full test stack are done and
+reproducible above.
 
 ## Design notes
 

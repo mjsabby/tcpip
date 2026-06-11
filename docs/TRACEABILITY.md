@@ -195,8 +195,53 @@ The deterministic-core guarantees hold **only** if the runtime honors:
 - **A-POLL-1** — After every event/API call the runtime drains
   `poll_action` until `None`, transmitting datagrams and arming/cancelling
   timers exactly as instructed. Timer identity is per `TimerKey`; re-arming
-  replaces.
+  replaces, and after a `CancelTimer` or replacing `StartTimer` the
+  superseded expiry must not be delivered (`TimerExpired` is trusted; a
+  stale fire is acted on as real). Drain *latency* is forgiving by design:
+  `poll_action` re-derives pending segments from connection state and timer
+  actions from the emitted/desired reconcile (which re-issues diffs shed by
+  a full action queue), so a delayed drain delays output rather than losing
+  it. A runtime that stops draining altogether stalls the protocol.
 - **A-MTU-1** — The buffer passed to `poll_action` is at least one MTU.
+
+### 5.1 Liveness & termination mechanization (`L-*`)
+
+How "the stack does not stall, loop, or exhaust" is checked rather than
+believed:
+
+- **L-BOUND-1 (timer boundary, model-checked).**
+  `formal/runtime_boundary.tla` models the reconcile protocol
+  (desired/emitted/queue/armed). TLC verifies `QuiescentFaithful` (when the
+  stack believes it is reconciled and the queue is drained, the runtime's
+  armed timer equals the desired deadline) and `Converges` (`<>[](armed =
+  desired)`) over the full state space; the pre-fix record-on-shed variant
+  is kept as a negative test that must still yield the stall
+  counterexample (`formal/check.sh`).
+- **L-ORACLE-1 (timer boundary, executed).** The harness's
+  `assert_timer_fidelity` compares its armed timers against
+  `Stack::timer_deadlines_of` at every forced quiescence across the fuzz
+  corpus, including hostile-runtime lanes that skip 50–70 % of drains
+  (`DrainPolicy::Lazy`). Catches lost, phantom, and mis-keyed timer
+  actions (e.g. reap-order generation bugs).
+- **L-FUEL-1 (drain termination, executed).** Every harness drain asserts
+  `poll_action` quiesces within `DRAIN_FUEL` actions; a violation means
+  the stack yields work forever (livelock, e.g. an ACK-generation loop).
+- **L-WEDGE-1 (no silent stall, executed).** Hostile-runtime fuzz lanes
+  assert every connection that survives a drain backlog converges once the
+  runtime recovers; aborting under abuse (R2, RFC 9293 §3.8.3) is
+  legitimate, silence is not.
+- **L-TERM-1 (loop termination, audited).** Every `loop`/`while` in the
+  core has a strictly decreasing measure or static bound: the TCP options
+  walk consumes ≥ 1 byte per iteration (`len < 2` rejected,
+  `wire/tcp.rs::parse_options`); the IPv6 extension-header walk is bounded
+  by `MAX_EXT_HEADERS`; checksum folding is bounded by carry width; all
+  other iteration is over fixed-capacity arrays.
+- **L-POOL-1 (resource exhaustion, executed).**
+  `security_and_edge::syn_flood_fills_pool_sheds_silently_and_recovers`:
+  a SYN flood pins at most `CONNS` slots, sheds the excess with zero
+  amplification, expires half-opens on the SYN-ACK retry budget, and
+  recovers. All queues are bounded and shed rather than grow
+  (`StackStats::{actions_shed, actions_peak}` make this observable).
 
 ---
 
@@ -222,7 +267,7 @@ PLAN.md proposes a three-layer proof strategy. Current state:
 | Layer | Tool | Status |
 |-------|------|--------|
 | 1 — model checking | TLA+ / TLC | **Checked.** `formal/tcp_fsm.tla` models the connection FSM and sequence-space bookkeeping. TLC (`formal/check.sh`) explores the full state space (1,388 distinct states at `MaxSeq = 6`) and reports *no error* for the `Safety` invariant (S-INV-1/2 + type/consistency) and the liveness properties `ClosingTerminates` (TIME-WAIT ⇝ CLOSED) and `ClosedIsForever`. Not yet modeled: retransmission/timers, RFC 5961, SACK, windows. |
-| 2 — theorem proving | Coq/Dafny/SPARK | **Not started.** The invariants in §3 are written to be portable to a prover; the sequence-arithmetic module (`seq.rs`) is the natural first target. |
+| 2 — theorem proving | Coq | **Started — `seq.rs` proved.** `formal/seq_arith.v` (Coq 8.20, 49 Qed, zero axioms/admits; run `formal/prove.sh`) mirrors every `seq.rs` definition formula-for-formula — including the `(b−a) as i32 > 0` comparison, modeled as two's-complement reinterpretation and *characterized* (`ltb_charact`/`leb_charact`: lt ⟺ forward distance ∈ [1, 2³¹−1]; le ⟺ ≤ 2³¹, antipode included). Proved on top: irreflexivity, global asymmetry/totality, antisymmetry & transitivity under the half-space precondition (with the 2³¹-antipode anomaly stated honestly in `le_antisym_cases`), the add/sub/since round-trip algebra, the triangle identity for distances, `in_window_spec` (the O(1) window test equals its RFC 9293 set definition), and `ack_acceptance` (the `una.lt(ack) && ack.le(nxt)` check accepts exactly SND.UNA+1 ..= SND.NXT under S-INV-1). The `seq.rs` unit tests are replayed as computed `Example`s. **Remaining:** port the §3 invariants and the buffer index arithmetic (`sendbuf`/`recvbuf`). |
 | 3 — property-based testing | proptest/libFuzzer | **Realized** as the deterministic seed-driven fuzzer (`fuzz_network.rs`), the packetdrill-style scripted-segment suite (`tests/scripted.rs`), and the per-module unit tests. A `cargo-fuzz` libFuzzer target is a drop-in next step (the wire parsers are pure functions over `&[u8]`). |
 | (cross-check) — live interop | TUN vs Linux kernel | **Realized** in `tools/tun-harness`: the stack exchanges bulk data (incl. half-close) with the real Linux TCP stack over a TUN device. Host-agnostic; FreeBSD/Windows pending. |
 
