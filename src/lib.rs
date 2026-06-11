@@ -72,5 +72,5 @@ mod stack;
 pub use stack::{Stack, StackStats};
 
 pub use types::{
-    Action, AppEvent, CloseReason, Error, Event, IpAddr, SocketAddr, SocketId, TimerKey,
+    Action, AppEvent, CloseReason, Error, Event, IpAddr, SocketAddr, SocketId, TimerKey, TimerKind,
 };

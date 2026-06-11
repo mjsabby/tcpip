@@ -80,6 +80,14 @@ pub struct StackStats {
     pub challenges_limited: u64,
     /// Echo replies sent.
     pub echo_tx: u64,
+    /// Actions dropped because the action queue was full (only possible
+    /// under an `A-POLL-1` drain backlog). Shed timer actions are re-issued
+    /// by the next reconcile; shed app events are not — recover from state
+    /// via `state_of` / `recv`.
+    pub actions_shed: u64,
+    /// High-water mark of the action queue — how close this deployment has
+    /// come to shedding (the queue holds `ACTION_QUEUE_SIZE` actions).
+    pub actions_peak: u16,
 }
 
 /// The TCP/IP host stack with `CONNS` connection slots and per-connection
@@ -185,6 +193,16 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     /// RCV.NXT for a live connection (test/diagnostic aid).
     pub fn rcv_nxt_of(&self, sock: SocketId) -> Option<u32> {
         self.conn_ref(sock).map(|c| c.rcv_nxt())
+    }
+
+    /// Desired timer deadlines `[Rexmit, Persist, DelAck, Wait]` for a live
+    /// connection (test/diagnostic aid). At quiescence — after `poll_action`
+    /// has returned `None` — the runtime's armed timers must equal exactly
+    /// this; harnesses use it as the two-sided timer-fidelity oracle.
+    pub fn timer_deadlines_of(&self, sock: SocketId) -> Option<[Option<Instant>; 4]> {
+        const KINDS: [TimerKind; 4] =
+            [TimerKind::Rexmit, TimerKind::Persist, TimerKind::DelAck, TimerKind::Wait];
+        self.conn_ref(sock).map(|c| KINDS.map(|k| c.timer_deadline(k)))
     }
 
     // ------------------------------------------------------------------
@@ -497,8 +515,19 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
                 ConnEvent::PeerFin => AppEvent::PeerFinReceived { sock },
                 ConnEvent::Closed(reason) => AppEvent::Closed { sock, reason },
             };
-            let _ = self.actions.push_back(Action::App(app));
+            self.queue_action(Action::App(app));
         }
+    }
+
+    /// Queue an action for the runtime. Returns false (and counts the shed)
+    /// when the queue is full, so callers can leave retryable state behind.
+    fn queue_action(&mut self, action: Action) -> bool {
+        if self.actions.push_back(action).is_err() {
+            self.stats.actions_shed += 1;
+            return false;
+        }
+        self.stats.actions_peak = self.stats.actions_peak.max(self.actions.len() as u16);
+        true
     }
 
     fn queue_reset(&mut self, local: SocketAddr, remote: SocketAddr, r: ResetReply) {
@@ -770,8 +799,12 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             if let Some(conn) = self.conns[idx].as_mut() {
                 if conn.is_closed() {
                     self.conns[idx] = None;
+                    // Cancel timers BEFORE bumping the generation: the cancel
+                    // keys must carry the generation the runtime armed them
+                    // under, or they match nothing and the runtime keeps
+                    // phantom timers until they fire (filtered, but leaked).
+                    self.reconcile_conn_timers(now, idx);
                     self.generations[idx] = self.generations[idx].wrapping_add(1);
-                    self.reconcile_conn_timers(now, idx); // emit cancels
                     continue;
                 }
                 conn.update_send_timers(now);
@@ -784,13 +817,15 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             let key = TimerKey::Reasm { slot: slot as u8 };
             match (desired, emitted) {
                 (Some(d), e) if e != Some(d) => {
-                    let _ = self
-                        .actions
-                        .push_back(Action::StartTimer { key, after: d.saturating_since(now) });
-                    self.emitted_reasm_timers[slot] = Some(d);
+                    // As in reconcile_conn_timers: only record what the queue
+                    // actually accepted, so shed actions are retried.
+                    if self.queue_action(Action::StartTimer { key, after: d.saturating_since(now) })
+                    {
+                        self.emitted_reasm_timers[slot] = Some(d);
+                    }
                 }
-                (None, Some(_)) => {
-                    let _ = self.actions.push_back(Action::CancelTimer { key });
+                // See reconcile_conn_timers: failed pushes retry next sweep.
+                (None, Some(_)) if self.queue_action(Action::CancelTimer { key }) => {
                     self.emitted_reasm_timers[slot] = None;
                 }
                 _ => {}
@@ -810,13 +845,17 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             let key = TimerKey::Conn { sock, kind };
             match (desired[k], self.emitted_conn_timers[idx][k]) {
                 (Some(d), e) if e != Some(d) => {
-                    let _ = self
-                        .actions
-                        .push_back(Action::StartTimer { key, after: d.saturating_since(now) });
-                    self.emitted_conn_timers[idx][k] = Some(d);
+                    // Record as emitted only if the queue accepted it, so a
+                    // shed action stays desired≠emitted and is retried by the
+                    // next reconcile instead of being lost.
+                    if self.queue_action(Action::StartTimer { key, after: d.saturating_since(now) })
+                    {
+                        self.emitted_conn_timers[idx][k] = Some(d);
+                    }
                 }
-                (None, Some(_)) => {
-                    let _ = self.actions.push_back(Action::CancelTimer { key });
+                // The guard queues the cancel; on a full queue it falls
+                // through and the diff is retried by the next reconcile.
+                (None, Some(_)) if self.queue_action(Action::CancelTimer { key }) => {
                     self.emitted_conn_timers[idx][k] = None;
                 }
                 _ => {}
@@ -986,6 +1025,91 @@ mod tests {
         assert_eq!(
             s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 3)),
             Err(Error::NoSlot)
+        );
+    }
+
+    /// A `StartTimer` shed by a full action queue must be re-offered by a
+    /// later reconcile, not recorded as already delivered. Before the
+    /// shed-retry fix, `reconcile_conn_timers` updated `emitted_conn_timers`
+    /// even when `push_back` failed, so the runtime silently never armed the
+    /// timer (e.g. a persist timer lost this way deadlocks a zero-window
+    /// connection). The queue can only be full mid-reconcile under an
+    /// `A-POLL-1` drain backlog, so the in-memory and interop harnesses —
+    /// all compliant runtimes — could never reach this path.
+    #[test]
+    fn timer_action_shed_on_full_queue_is_retried() {
+        let mut s = seeded(IpAddr::v4(10, 0, 0, 1));
+        let now = Instant::ZERO;
+        let mut tx = [0u8; 1500];
+
+        // Open a connection and drain to quiescence: the SYN is emitted and
+        // its retransmit timer is armed runtime-side (emitted == desired).
+        let sock = s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80)).unwrap();
+        while s.poll_action(now, &mut tx).is_some() {}
+        let idx = sock.index as usize;
+        let rexmit = TimerKind::Rexmit as usize;
+        assert!(s.emitted_conn_timers[idx][rexmit].is_some(), "SYN rexmit timer armed");
+
+        // Simulate the backlog moment the bug needed: the runtime has NOT
+        // been told about the deadline, and the action queue is full.
+        s.emitted_conn_timers[idx][rexmit] = None;
+        while s.actions.push_back(Action::RequestEntropy).is_ok() {}
+        let shed_before = s.stats.actions_shed;
+
+        s.reconcile_conn_timers(now, idx);
+
+        // The shed StartTimer must be counted and must NOT be marked
+        // emitted — that lie is what made the loss permanent.
+        assert!(s.stats.actions_shed > shed_before, "shed action is observable in stats");
+        assert!(
+            s.emitted_conn_timers[idx][rexmit].is_none(),
+            "a shed StartTimer must not be recorded as delivered"
+        );
+
+        // Once the runtime catches up (drains the backlog), the diff is
+        // still pending, so the sweep re-offers the StartTimer.
+        let mut rearmed = false;
+        while let Some(a) = s.poll_action(now, &mut tx) {
+            if let Action::StartTimer { key: TimerKey::Conn { sock: k, kind: TimerKind::Rexmit }, .. } = a
+                && k == sock
+            {
+                rearmed = true;
+            }
+        }
+        assert!(rearmed, "retried StartTimer delivered after the backlog cleared");
+        assert!(s.emitted_conn_timers[idx][rexmit].is_some(), "emitted state reconverged");
+    }
+
+    /// When a dead slot is reaped, its `CancelTimer` actions must carry the
+    /// generation the runtime armed the timers under. Bumping the slot
+    /// generation before emitting the cancels keys them to a connection
+    /// that never existed: the runtime cancels nothing and keeps phantom
+    /// timers armed until they fire (filtered as stale, but leaked until
+    /// then — a real leak for timer wheels keyed by `TimerKey`).
+    #[test]
+    fn reaped_slot_cancels_carry_the_armed_generation() {
+        let mut s = seeded(IpAddr::v4(10, 0, 0, 1));
+        let now = Instant::ZERO;
+        let mut tx = [0u8; 1500];
+
+        // SYN emitted: the runtime armed Rexmit under `sock`'s generation.
+        let sock = s.connect(now, SocketAddr::new(IpAddr::v4(10, 0, 0, 2), 80)).unwrap();
+        while s.poll_action(now, &mut tx).is_some() {}
+
+        // Abort and reap. The drain must cancel the Rexmit timer with the
+        // SAME key it was armed under.
+        s.abort(sock).unwrap();
+        let mut cancelled_original = false;
+        while let Some(a) = s.poll_action(now, &mut tx) {
+            if let Action::CancelTimer { key: TimerKey::Conn { sock: k, kind: TimerKind::Rexmit } } = a
+                && k == sock
+            {
+                cancelled_original = true;
+            }
+        }
+        assert!(
+            cancelled_original,
+            "reaping emitted no CancelTimer for the armed key — phantom timer leaked"
         );
     }
 }
