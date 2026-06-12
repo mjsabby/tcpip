@@ -435,9 +435,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             });
         }
         let n = self.send_buf.write(data);
-        if n < data.len() {
-            self.app_blocked = true;
-        }
+        // `app_blocked` arms a one-shot Writable on the next ACK that
+        // frees space. A fully-accepted send means the app is no longer
+        // waiting; clear it so a later ACK doesn't fire a spurious
+        // Writable for a backpressure the app already worked past
+        // (DEF-L52).
+        self.app_blocked = n < data.len();
         Ok(n)
     }
 

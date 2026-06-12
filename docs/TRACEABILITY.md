@@ -521,6 +521,42 @@ to add coverage.
   accumulator reset on RTO; SipHash `expect` fail-closed; SACK degenerate
   fallback head-rexmit; checksum mixed-AF fail-closed.
 
+### Round-2b (independent parallel audit, post-`aff4439`)
+
+A second independent adversarial pass over the `6df2d99` baseline
+surfaced 16 findings; 8 were already closed by round 2 (DEF-H8, M21,
+L39, M20, L44, L43, M16; H-2 ≡ M21). Of the remainder:
+
+- **DEF-H8 refined** — `.ge` deliberately trades silent truncation
+  (forged-earlier FIN) for a *detectable* stall (forged-later FIN);
+  comment now states the policy and its rationale. The parallel audit's
+  alternative (`.le`, prefer truncation) is rejected for safety-critical
+  use: silent data loss is worse than a peer-RTO-bounded stall.
+- **DEF-M29** — `MF=1` fragment with `end == total_len` contradicts the
+  recorded total; I-REASM-2 now drops it.
+- **DEF-M30** — closed-port RSTs share the RFC 5961 §10 token bucket
+  (S-RST-1: rate-limited like Linux/BSD; bounds port-scan and 1:1
+  reflection). RFC 9293 mandates the RST, not its rate.
+- **DEF-L48** — `Reassembler::push` `offset: u32` uses `checked_add`
+  (wire callers pass widened u16; this hardens the public API).
+- **DEF-L49** — `rst_tx` counts queued, not attempted.
+- **DEF-L50** — `connect_from` rejects `is_local(remote.ip)` (LAND at
+  the API; the on-wire SYN would have been martian-dropped anyway).
+- **DEF-L51** — `challenge_acks_per_sec = 0` now means "disable" (silent
+  drop), not 1/sec.
+- **DEF-L52** — `app_blocked` cleared by a fully-accepted `send()`; no
+  spurious `Writable` for backpressure the app already worked past.
+- **Rejected as false positive** — "slow-start not ABC-protected":
+  `cwnd += min(N, SMSS)` is per-*byte*-bounded; ACK-division (M sub-ACKs
+  of `N/M` bytes) yields `M × N/M = N` growth, identical to one ACK.
+  RFC 3465 L=2 in slow start would only *speed up* stretch ACKs.
+  Comment added at `cc.rs::on_new_ack` documenting the analysis.
+- **Documented as latent** — `ipv6::parse_quote` reads only the fixed
+  header; an outbound packet with extension headers before TCP would
+  have its ICMP-error quote misrouted. This stack never emits extension
+  headers (`ipv6::emit`), so unreachable today; flagged for any future
+  extension-header emitter.
+
 ### 5.1 addendum
 
 - **L-MTU-1 (datagram-fits-MTU oracle, executed).** The harness asserts

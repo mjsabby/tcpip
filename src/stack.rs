@@ -547,6 +547,10 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
             || remote.port == 0
             || local.port == 0
             || !remote.ip.is_unicast_source()
+            // DEF-L50: connecting to ourselves would emit a SYN with
+            // src == dst that the LAND filter drops on receipt — the
+            // slot just times out. Reject at the API.
+            || self.cfg.is_local(&remote.ip)
         {
             return Err(Error::Unaddressable);
         }
@@ -768,13 +772,19 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
     }
 
     fn queue_reset(&mut self, local: SocketAddr, remote: SocketAddr, r: ResetReply) {
-        self.stats.rst_tx += 1;
-        let _ = self.ctl.push_back(CtlSegment {
-            local,
-            remote,
-            seq: r.seq,
-            ack: r.ack,
-        });
+        // DEF-L49: count only RSTs that actually queued for transmit.
+        if self
+            .ctl
+            .push_back(CtlSegment {
+                local,
+                remote,
+                seq: r.seq,
+                ack: r.ack,
+            })
+            .is_ok()
+        {
+            self.stats.rst_tx += 1;
+        }
     }
 
     /// RFC 5961 §10: token-bucket limit on challenge ACKs.
@@ -787,8 +797,13 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
     /// the victim's RCV.NXT. Jittering the cap per second removes the exact
     /// reference the attacker needs.
     fn take_challenge_token(&mut self, now: Instant) -> bool {
+        let cap = self.cfg.challenge_acks_per_sec;
+        // DEF-L51: `cap = 0` disables challenge ACKs / closed-port RSTs
+        // entirely (silent-drop policy), rather than flooring to 1/sec.
+        if cap == 0 {
+            return false;
+        }
         if now >= self.challenge_refill_at {
-            let cap = self.cfg.challenge_acks_per_sec;
             let jitter = self
                 .isn
                 .keyed_hash(domain::CHALLENGE_ACK, now.as_micros() / 1_000_000)
@@ -877,6 +892,15 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
         if h.flags.rst() {
             return;
         }
+        // DEF-M30: rate-limit closed-port RSTs through the same token
+        // bucket as RFC 5961 challenge ACKs. Unbounded RSTs allow
+        // efficient port-scan and 1:1 reflection toward a spoofed
+        // victim; Linux/BSD rate-limit them for the same reason. (RFC
+        // 9293 mandates the RST, not its rate; a dropped probe simply
+        // retries.)
+        if !self.take_challenge_token(now) {
+            return;
+        }
         let reply = if h.flags.ack() {
             // "<SEQ=SEG.ACK><CTL=RST>"
             CtlSegment {
@@ -895,8 +919,10 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
                 ack: Some(SeqNr(h.seq).add(seg_len)),
             }
         };
-        self.stats.rst_tx += 1;
-        let _ = self.ctl.push_back(reply);
+        // DEF-L49: count only RSTs that actually queued for transmit.
+        if self.ctl.push_back(reply).is_ok() {
+            self.stats.rst_tx += 1;
+        }
     }
 
     fn accept_syn(

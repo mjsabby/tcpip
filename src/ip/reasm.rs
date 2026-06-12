@@ -101,7 +101,11 @@ impl Reassembler {
         if data.is_empty() && more {
             return ReasmResult::Dropped;
         }
-        let end = offset + data.len() as u32;
+        // DEF-L48: `offset` is u16-derived on every wire path, but the
+        // public API takes u32 — fail closed rather than wrap in debug.
+        let Some(end) = offset.checked_add(data.len() as u32) else {
+            return ReasmResult::Dropped;
+        };
         if end as usize > REASM_BUF_SIZE {
             // Datagram cannot fit: drop the whole reassembly, not just the
             // fragment, so we don't hold state we can never complete.
@@ -145,8 +149,12 @@ impl Reassembler {
             }
         }
         if let Some(t) = slot.total_len
-            && end > t
+            && (end > t || (more && end == t))
         {
+            // `end > total`: data past the known length. `more && end ==
+            // total`: MF=1 asserts more data exists past `end`, which
+            // contradicts `total = end` — the strict-overlap policy
+            // (I-REASM-2) drops on any inconsistency (DEF-M29).
             slot.in_use = false;
             return ReasmResult::Dropped;
         }
