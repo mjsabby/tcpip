@@ -27,6 +27,10 @@ impl Checksum {
 
     /// Add a chunk of bytes.
     pub fn add_bytes(&mut self, data: &[u8]) {
+        // Fold eagerly so `sum` cannot overflow u32 regardless of how the
+        // caller chunks the input: every add of ≤ 2^16 is preceded by a
+        // fold-to-< 2^17 (DEF-L44).
+        self.fold();
         let mut i = 0;
         if self.odd && !data.is_empty() {
             self.sum += data[0] as u32;
@@ -35,8 +39,6 @@ impl Checksum {
         }
         while i + 1 < data.len() {
             self.sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
-            // Fold eagerly enough that `sum` cannot overflow u32: each word
-            // adds < 2^16 and we fold once it exceeds 2^24.
             if self.sum > 0x00ff_ffff {
                 self.sum = (self.sum & 0xffff) + (self.sum >> 16);
             }
@@ -45,6 +47,13 @@ impl Checksum {
         if i < data.len() {
             self.sum += (data[i] as u32) << 8;
             self.odd = true;
+        }
+    }
+
+    #[inline]
+    fn fold(&mut self) {
+        while self.sum >> 16 != 0 {
+            self.sum = (self.sum & 0xffff) + (self.sum >> 16);
         }
     }
 
@@ -77,7 +86,10 @@ impl Checksum {
         match (src, dst) {
             (IpAddr::V4(s), IpAddr::V4(d)) => self.add_pseudo_v4(s, d, proto, len as u16),
             (IpAddr::V6(s), IpAddr::V6(d)) => self.add_pseudo_v6(s, d, proto, len),
-            _ => debug_assert!(false, "mixed address families in pseudo-header"),
+            // Unreachable today, but fail-closed: a no-op here would
+            // silently produce a *valid-looking* checksum over the wrong
+            // pseudo-header in release builds (DEF-L44).
+            _ => unreachable!("mixed address families in pseudo-header"),
         }
     }
 

@@ -79,6 +79,8 @@ impl CongestionControl {
     pub fn on_rto(&mut self, flight: u32) {
         self.ssthresh = (flight / 2).max(2 * self.mss);
         self.cwnd = self.mss;
+        self.ca_bytes_acked = 0;
+        self.inflate_budget = 0;
     }
 
     /// Enter NewReno fast recovery (RFC 5681 §3.2 steps 2–3): halve, then
@@ -110,9 +112,18 @@ impl CongestionControl {
     }
 
     /// Partial ACK during NewReno recovery (RFC 6582 §3.2 step 5): deflate
-    /// by the amount acknowledged, then add back one SMSS.
+    /// by the amount acknowledged, then add back one SMSS. The deflate term
+    /// is floored at one SMSS so that a receiver splitting one segment's
+    /// acknowledgment into N micro-ACKs cannot grow `cwnd` by ~N·SMSS
+    /// (Savage et al. 1999 — the same attack DEF-M8/M9 close on the dup-ACK
+    /// and CA paths; this was the third vector, DEF-H11).
     pub fn on_partial_ack(&mut self, acked: u32) {
-        self.cwnd = self.cwnd.saturating_sub(acked).max(self.mss) + self.mss;
+        self.cwnd = self
+            .cwnd
+            .saturating_sub(acked.max(self.mss))
+            .max(self.mss)
+            .saturating_add(self.mss)
+            .min(CWND_MAX);
     }
 
     /// Recovery completed (RFC 6582 §3.2 step 1 / RFC 6675 §5.1): deflate
@@ -196,6 +207,28 @@ mod tests {
         }
         // 16 segments in flight, 3 already accounted at entry → ≤ 13 more.
         assert!(cc.cwnd <= after_entry + 13 * MSS);
+    }
+
+    #[test]
+    fn partial_ack_division_does_not_grow_cwnd() {
+        // DEF-H11: a malicious receiver splitting one segment's
+        // acknowledgment into N 1-byte partial ACKs must not grow cwnd
+        // by ~N·MSS (the third Savage'99 vector — `inflate` and
+        // `on_new_ack` were already guarded; `on_partial_ack` was not).
+        let mut cc = CongestionControl::new(MSS);
+        cc.cwnd = 16 * MSS;
+        cc.enter_fast_recovery(16 * MSS);
+        let after_entry = cc.cwnd;
+        for _ in 0..1_000_000 {
+            cc.on_partial_ack(1);
+        }
+        assert!(
+            cc.cwnd <= after_entry,
+            "cwnd grew under partial-ACK division: {} > {}",
+            cc.cwnd,
+            after_entry
+        );
+        assert!(cc.cwnd <= CWND_MAX);
     }
 
     #[test]

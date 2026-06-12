@@ -164,6 +164,9 @@ pub struct Connection<const SND: usize, const RCV: usize> {
     pub(crate) probe_pending: bool,
     /// Window advertised in the last segment we emitted.
     pub(crate) last_wnd_advertised: u32,
+    /// Right edge `RCV.NXT + RCV.WND` last advertised; never moves left
+    /// (RFC 9293 §3.8.6.2.1, DEF-L35).
+    pub(crate) rcv_adv: SeqNr,
     /// Set when the app hit a full send buffer (Writable edge trigger).
     pub(crate) app_blocked: bool,
 
@@ -189,6 +192,12 @@ pub struct Connection<const SND: usize, const RCV: usize> {
 
     // --- Path MTU ---
     pub(crate) pmtu_mss: u16,
+    /// When to revert `pmtu_mss` to the link-derived value and re-probe
+    /// (RFC 1191 §6.3). `None` means the link value is in effect.
+    pub(crate) pmtu_expires: Option<Instant>,
+    /// Earliest time another PMTU-triggered head retransmission is allowed
+    /// (rate-limits the forged step-down PTB amplifier — DEF-M19).
+    pub(crate) pmtu_rexmit_after: Instant,
 
     // --- Accounting ---
     pub(crate) passive: bool,
@@ -248,6 +257,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             rexmit_now: false,
             probe_pending: false,
             last_wnd_advertised: 0,
+            rcv_adv: SeqNr(0),
             app_blocked: false,
             timers: [None; 4],
             rtt: RttEstimator::new(cfg.rto_initial, cfg.rto_min, cfg.rto_max),
@@ -260,6 +270,8 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             scoreboard: SackScoreboard::new(),
             sack_cursor: iss,
             pmtu_mss: params.pmtu_mss,
+            pmtu_expires: None,
+            pmtu_rexmit_after: Instant::ZERO,
             passive: false,
             listener_port: 0,
             reported: false,
@@ -369,6 +381,18 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     }
 
     /// Was this connection accepted via a listener?
+    /// True when the connection is synchronized but the application has not
+    /// yet been told (the `Connected` event was shed under backlog —
+    /// DEF-M26). The sweep re-emits it.
+    pub fn needs_connected_event(&self) -> bool {
+        !self.reported
+            && !matches!(
+                self.state,
+                State::Closed | State::SynSent | State::SynReceived
+            )
+    }
+
+    /// Listener port this connection was accepted on, if passive.
     pub fn accepted_on(&self) -> Option<u16> {
         self.passive.then_some(self.listener_port)
     }
@@ -479,9 +503,10 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
                 | State::Closing
                 | State::LastAck
         ) {
+            // RFC 9293 §3.10.5: <SEQ=SND.NXT><CTL=RST> (no ACK).
             Some(ResetReply {
                 seq: self.snd_nxt,
-                ack: Some(self.rcv_nxt),
+                ack: None,
             })
         } else {
             None
@@ -499,9 +524,13 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         // delivers an old fire after a re-arm would otherwise be trusted —
         // for Rexmit that means a spurious cwnd collapse and a step toward
         // `max_data_retries`. If our desired deadline is still in the
-        // future, this fire is stale; drop it. Reconcile re-emits the
-        // StartTimer for the still-desired deadline.
-        if self.timers[kind as usize].is_some_and(|d| now < d) {
+        // future, this fire is stale; drop it. A fire for a timer we
+        // *don't want at all* (`None`) is also stale by definition
+        // (DEF-L29). Reconcile re-emits the StartTimer for any
+        // still-desired deadline (the stack clears `emitted` on every
+        // gen-matched fire, so an early-fire here triggers a re-arm
+        // rather than leaving a zombie deadline — DEF-L30).
+        if self.timers[kind as usize].is_none_or(|d| now < d) {
             return;
         }
         self.timers[kind as usize] = None;
@@ -532,11 +561,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
                 }
             }
             TimerKind::Wait => match self.state {
-                // TIME-WAIT 2*MSL elapsed (RFC 9293 §3.10.7.4) or the
-                // FIN-WAIT-2 orphan timeout: the connection is done.
-                State::TimeWait | State::FinWait2 => {
-                    self.enter_closed(CloseReason::Normal, fx);
-                }
+                // TIME-WAIT 2*MSL elapsed (RFC 9293 §3.10.7.4): graceful.
+                State::TimeWait => self.enter_closed(CloseReason::Normal, fx),
+                // FIN-WAIT-2 orphan timeout: the peer never sent its FIN.
+                // Report this as a timeout, not a graceful close, so the
+                // app can distinguish (DEF-L33).
+                State::FinWait2 => self.enter_closed(CloseReason::TimedOut, fx),
                 _ => {}
             },
         }
@@ -587,24 +617,46 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// Path MTU changed (stack plumbs ICMP signals here). A shrink triggers
     /// an immediate retransmission sized to the new MSS (RFC 1191 §3).
-    pub fn on_pmtu_change(&mut self, pmtu_mss: u16) {
+    pub fn on_pmtu_change(&mut self, now: Instant, pmtu_mss: u16) {
         let shrunk = pmtu_mss < self.pmtu_mss;
-        self.pmtu_mss = pmtu_mss;
-        self.cc.set_mss(self.eff_send_mss() as u32);
-        if shrunk && self.bytes_in_flight() > 0 {
+        if shrunk {
+            self.pmtu_mss = pmtu_mss;
+            // DEF-M18: a per-connection reduction also ages out — otherwise
+            // one forged PTB degrades a long-lived connection forever even
+            // after the shared cache has recovered.
+            self.pmtu_expires = Some(now + crate::ip::pmtu::PMTU_TTL);
+            self.cc.set_mss(self.eff_send_mss() as u32);
+        }
+        if shrunk && self.bytes_in_flight() > 0 && now >= self.pmtu_rexmit_after {
             // Don't count against the retry budget and don't collapse cwnd:
-            // nothing was lost to congestion (RFC 1191 §3).
+            // nothing was lost to congestion (RFC 1191 §3). Limit to one
+            // retransmission per RTO so that a step-down PTB(N), PTB(N-1),
+            // … flood cannot reflect ~N head segments toward the peer
+            // (DEF-M19).
             self.rexmit_now = true;
             self.rtt_sample = None; // the in-flight segment will be resent
+            self.pmtu_rexmit_after = now + self.rtt.rto();
+        }
+    }
+
+    /// Re-probe the path MTU if the per-connection reduction has aged out
+    /// (RFC 1191 §6.3 / DEF-M18). Called from the periodic sweep.
+    pub(crate) fn maybe_age_pmtu(&mut self, now: Instant) {
+        if self.pmtu_expires.is_some_and(|t| now >= t) {
+            self.pmtu_mss = self.params.pmtu_mss;
+            self.pmtu_expires = None;
+            self.cc.set_mss(self.eff_send_mss() as u32);
         }
     }
 
     /// RFC 5927 §4 mitigation: an ICMP error quoting one of our segments is
     /// only honored if the quoted sequence number could currently be in
-    /// flight.
+    /// flight. With nothing in flight, *no* quote is plausible — an idle
+    /// connection has no segment on the wire for an ICMP error to refer to
+    /// (DEF-L34).
     pub fn icmp_quote_plausible(&self, seq: SeqNr) -> bool {
-        let span = self.snd_nxt.since(self.snd_una).max(1);
-        seq.in_window(self.snd_una, span)
+        let span = self.snd_nxt.since(self.snd_una);
+        span > 0 && seq.in_window(self.snd_una, span)
     }
 
     /// An ICMP hard error (port/protocol unreachable) for this connection.
@@ -720,6 +772,12 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             if !outstanding {
                 self.rexmit_count = 0;
             }
+        } else if self.timers[TimerKind::Rexmit as usize].is_none() {
+            // DEF-H10: outstanding sequence space with neither timer covering
+            // it (the persist→idle edge when the peer reopens its window
+            // without ACKing the probe byte) — arm Rexmit so the byte/FIN is
+            // never stranded.
+            self.timers[TimerKind::Rexmit as usize] = Some(now + self.rtt.rto());
         }
         let want_persist = probing;
         match (want_persist, self.timers[TimerKind::Persist as usize]) {

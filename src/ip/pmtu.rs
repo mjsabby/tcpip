@@ -51,14 +51,11 @@ impl<const N: usize> PmtuCache<N> {
 
     /// Process a fragmentation-needed / packet-too-big report for `dst`.
     /// `reported` is the MTU field from the ICMP message (0 from pre-1191
-    /// routers). Returns the new estimate if it *lowered* the path MTU.
-    pub fn update(
-        &mut self,
-        now: Instant,
-        link_mtu: u16,
-        dst: &IpAddr,
-        reported: u32,
-    ) -> Option<u16> {
+    /// routers). Returns the floor-clamped estimate the report implies; the
+    /// shared cache is only *lowered* (raises arrive only by aging out —
+    /// S-PMTU-1), but the caller must still propagate the value to every
+    /// connection toward `dst` whose own estimate exceeds it (DEF-H9).
+    pub fn update(&mut self, now: Instant, link_mtu: u16, dst: &IpAddr, reported: u32) -> u16 {
         let current = self.get(now, link_mtu, dst);
         let floor = match dst {
             IpAddr::V4(_) => IPV4_MIN_PMTU,
@@ -77,12 +74,13 @@ impl<const N: usize> PmtuCache<N> {
         } else {
             reported.min(u16::MAX as u32) as u16
         };
-        let new = candidate.clamp(floor, link_mtu);
-        if new >= current {
-            return None; // raises arrive only by aging out (S-PMTU-1)
+        // DEF-H12: never assume `link_mtu >= floor`; a misconfigured `cfg.mtu`
+        // would otherwise panic at `core::cmp::clamp` on the next ICMP PTB.
+        let new = candidate.max(floor).min(link_mtu.max(floor));
+        if new < current {
+            self.insert(now, dst, new);
         }
-        self.insert(now, dst, new);
-        Some(new)
+        new
     }
 
     fn insert(&mut self, now: Instant, dst: &IpAddr, mtu: u16) {
@@ -131,10 +129,11 @@ mod tests {
         let mut c: PmtuCache<4> = PmtuCache::new();
         let dst = IpAddr::v4(192, 0, 2, 1);
         assert_eq!(c.get(T0, LINK, &dst), 1500);
-        assert_eq!(c.update(T0, LINK, &dst, 1280), Some(1280));
+        assert_eq!(c.update(T0, LINK, &dst, 1280), 1280);
         assert_eq!(c.get(T0, LINK, &dst), 1280);
-        // A *higher* report never raises the estimate.
-        assert_eq!(c.update(T0, LINK, &dst, 1400), None);
+        // A *higher* report never raises the cached estimate (S-PMTU-1) but
+        // the clamped value is still returned for per-conn propagation.
+        assert_eq!(c.update(T0, LINK, &dst, 1400), 1400);
         assert_eq!(c.get(T0, LINK, &dst), 1280);
         // After the TTL the link MTU is used again.
         let later = T0 + PMTU_TTL + Duration::from_secs(1);
@@ -146,8 +145,8 @@ mod tests {
         let mut c: PmtuCache<4> = PmtuCache::new();
         let dst = IpAddr::v4(192, 0, 2, 2);
         // From 1500 the next plateau down is 1492, then 1006...
-        assert_eq!(c.update(T0, LINK, &dst, 0), Some(1492));
-        assert_eq!(c.update(T0, LINK, &dst, 0), Some(1006));
+        assert_eq!(c.update(T0, LINK, &dst, 0), 1492);
+        assert_eq!(c.update(T0, LINK, &dst, 0), 1006);
     }
 
     #[test]
@@ -155,10 +154,19 @@ mod tests {
         let mut c: PmtuCache<4> = PmtuCache::new();
         let v4 = IpAddr::v4(192, 0, 2, 3);
         let v6 = IpAddr::v6([0xfc00, 0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!(c.update(T0, LINK, &v4, 100), Some(IPV4_MIN_PMTU));
-        assert_eq!(c.update(T0, LINK, &v6, 100), Some(IPV6_MIN_PMTU));
+        assert_eq!(c.update(T0, LINK, &v4, 100), IPV4_MIN_PMTU);
+        assert_eq!(c.update(T0, LINK, &v6, 100), IPV6_MIN_PMTU);
         // Already at the floor: nothing lowers further.
-        assert_eq!(c.update(T0, LINK, &v6, 64), None);
+        assert_eq!(c.update(T0, LINK, &v6, 64), IPV6_MIN_PMTU);
+        assert_eq!(c.get(T0, LINK, &v6), IPV6_MIN_PMTU);
+    }
+
+    #[test]
+    fn misconfigured_link_mtu_below_floor_does_not_panic() {
+        // DEF-H12: cfg.mtu < family floor must not abort on the next ICMP PTB.
+        let mut c: PmtuCache<4> = PmtuCache::new();
+        let v6 = IpAddr::v6([0xfc00, 0, 0, 0, 0, 0, 0, 2]);
+        assert_eq!(c.update(T0, 1000, &v6, 800), IPV6_MIN_PMTU);
     }
 
     #[test]

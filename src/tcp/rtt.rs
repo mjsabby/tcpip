@@ -25,10 +25,18 @@ pub struct RttEstimator {
 impl RttEstimator {
     /// New estimator with the configured initial RTO and clamps.
     pub fn new(initial: Duration, rto_min: Duration, rto_max: Duration) -> Self {
+        // Defensively order the bounds and clamp the initial value so that
+        // a misconfiguration (`rto_min > rto_max`, `rto_initial = 0`) can't
+        // freeze backoff at zero or invert the clamp (DEF-L23).
+        let (rto_min, rto_max) = if rto_min <= rto_max {
+            (rto_min, rto_max)
+        } else {
+            (rto_max, rto_min)
+        };
         RttEstimator {
             srtt: None,
             rttvar: Duration::ZERO,
-            rto: initial,
+            rto: initial.clamp(rto_min, rto_max),
             rto_min,
             rto_max,
         }

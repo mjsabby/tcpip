@@ -136,6 +136,21 @@ Each deviation is a conscious scope decision from PLAN.md, not an oversight.
 - **D-SYN-1** — No SYN-cookie fallback: when the connection table is full a
   SYN is dropped (the peer retries). Bounded memory is preferred over
   accepting unbounded half-open state. `stack.rs` `accept_syn`.
+- **D-TCP-4** — TIME-WAIT does not transition to SYN-RECEIVED on a fresh
+  SYN with `SEG.SEQ > RCV.NXT` (RFC 9293 §3.10.7.4 / RFC 6191). The
+  conservative choice (wait out 2·MSL) is taken: without timestamps
+  (D-WS-1) the seq-only heuristic is weak, and routing the reopen back
+  through the listener requires `Effects` to carry stack-level intent.
+  Consequence: a client reusing the exact 4-tuple within 2·MSL after our
+  active close is challenge-ACKed until the slot expires (≤ 60 s default).
+- **D-IPV6-2** — RFC 7112 ("first fragment must contain the entire header
+  chain") is not enforced. The stack reassembles fully before parsing the
+  upper-layer header, so an attacker placing the TCP header in a non-first
+  fragment gains nothing against *this host* — only against any stateless
+  middlebox in front of it, which is that middlebox's RFC 7112 concern.
+- **D-IPV6-3** — Subnet/directed broadcast cannot be filtered:
+  `is_unicast_source()` has no netmask. The link-layer adapter (or a
+  firewall) is responsible for directed-broadcast suppression.
 
 ---
 
@@ -422,6 +437,96 @@ to add coverage.
   `TypeOK` bounded `SND.UNA` to `0..MaxSeq`, excluding the legitimate
   post-FIN value `MaxSeq+1`. **Found by:** TLC. **Fix:** widen the bound.
   Demonstrates the model-checking layer catching a specification error.
+
+### Round-2 adversarial audit (20-lens, post-`6df2d99`)
+
+- **DEF-C5 — `eff_send_mss` ignored TCP-option overhead.** Payload sized to
+  `MTU − 40`, *then* SACK blocks (≤ 36 B) attached → IP datagram of
+  `MTU + 36`. With `tx ≥ MTU` per A-MTU-1: slice-index panic; with DF set:
+  PMTU blackhole loop. Triggerable by any peer with one out-of-order
+  segment. **Fix:** compute SACK blocks first; charge `4 + 8n` against the
+  payload budget (RFC 6691). **Tests:**
+  `security_and_edge::full_mss_segment_with_sack_blocks_fits_mtu`; standing
+  oracle **L-MTU-1** in the harness asserts every `Transmit{len} ≤ mtu`.
+- **DEF-H7 — `CLOSING` reached with FIN unsent ⇒ permanent slot leak.**
+  `try_consume_fin` moved `FinWait1 → Closing` unconditionally; `plan_data`
+  / `plan_fin` excluded `Closing`; nothing transmitted, no timer. Reachable
+  via ordinary simultaneous close under cwnd. **Fix:** `Closing` in both
+  allowlists.
+- **DEF-H8 — `peer_fin` overwrite condition inverted.** `.le(f)` *accepted*
+  earlier (injected) FINs, truncating the stream — the exact attack the
+  comment claimed to defend against. **Fix:** `.ge(f)`. **Test:**
+  `security_and_edge::injected_earlier_fin_does_not_truncate_stream`.
+- **DEF-H9 — sibling-connection PMTU blackhole.** `pmtu.update()` returned
+  `None` when the cache was already at the report → second connection
+  toward the same destination never told. **Fix:** `update()` returns the
+  floor-clamped value unconditionally; conn `on_pmtu_change` decides.
+- **DEF-H10 — probe byte stranded with no timer.** Persist→idle edge with
+  the probe byte unACKed left both Rexmit and Persist disarmed. **Fix:**
+  `update_send_timers` arms Rexmit when `outstanding && !probing && None`.
+- **DEF-H11 — NewReno `on_partial_ack` was the unguarded third Savage'99
+  vector.** No `CWND_MAX` cap, no inflate-budget gate; receiver-driven
+  micro-partial-ACKs grew cwnd unboundedly. **Fix:** floor `acked` at SMSS,
+  cap at `CWND_MAX`. **Test:**
+  `cc::tests::partial_ack_division_does_not_grow_cwnd`.
+- **DEF-H12 — `pmtu` clamp panic on `cfg.mtu < floor`.** `core::clamp` on
+  `(floor, link_mtu)` aborted on the next ICMP PTB. **Fix:** total-function
+  `max(floor).min(link_mtu.max(floor))`. **Test:**
+  `pmtu::tests::misconfigured_link_mtu_below_floor_does_not_panic`.
+- **DEF-M16 — IPv4-mapped IPv6 bypassed `is_unicast_source()`.**
+  `::ffff:224.0.0.1` etc. passed the V6 arm, reopening S-MARTIAN-1.
+  **Fix:** judge `::ffff:0:0/96` and `::/96` by the embedded v4 address.
+  **Test:** `types::tests::unicast_source_filter`.
+- **DEF-M17 — `Event` derived `Debug` exposed the entropy seed.** L-7
+  redacted the *stored* key but not the *input* event. **Fix:** manual
+  `Debug` for `Event`. **Test:**
+  `types::tests::entropy_event_debug_is_redacted`.
+- **DEF-M18/M19 — per-conn PMTU never aged; step-down PTB amplifier.**
+  `pmtu_mss` was permanent; each strictly-lower forged PTB triggered an
+  uncounted head retransmit (~18× byte amplification over ~924 packets).
+  **Fix:** `pmtu_expires` per conn; ≤ 1 PMTU-rexmit per RTO.
+- **DEF-M20 — reasm slot generation u8 wrapped in ≈ 512 packets.** Widened
+  to u32, matching `SocketId` rationale.
+- **DEF-M21 — TIME-WAIT 2·MSL restarted by *any* out-of-window FIN.** Slot
+  pinnable + 1:1 ACK reflection. **Fix:** restart only when
+  `seq + seg_len == rcv_nxt` (the genuine retransmitted FIN).
+- **DEF-M22 — duplicate-final fragment left slot stuck Pending.**
+  `covered == 0 && identical → Pending` skipped the completion check.
+  **Fix:** fall through to `finish()`.
+- **DEF-M23 — zero-window receiver dropped piggybacked ACK.** RFC 9293
+  §3.10.7.4 step 1 "special allowance for valid ACKs" was not made; our
+  send side falsely aborted while the peer was alive. **Fix:** process
+  in-range ACK on the unacceptable-seq path.
+- **DEF-M24 — IPv6 atomic fragments routed through reassembly state.**
+  RFC 6946. **Fix:** `offset == 0 && !more` bypasses reasm.
+- **DEF-M25 — multi-address LAND.** `src == dst` missed `src ==
+  other-local-addr`. **Fix:** `is_local(&src)`.
+- **DEF-M26 — shed passive `Connected` orphaned the slot.** README's
+  "state is the truth" recovery was unreachable without the SocketId.
+  **Fix:** roll back `reported`; sweep re-emits.
+- **DEF-M27 — SACK scoreboard overflow dropped *newest* block.** Recovery
+  blind to current loss. **Fix:** evict the lowest range.
+- **DEF-M28 — `recvbuf::insert` preconditions debug_assert-only.**
+  Violation in release desynced `RCV.NXT` by ~ 4 G. **Fix:** clamp.
+- **DEF-L23..L47 (selected).** `Config::normalize()` at `Stack::new`
+  (closes the wire-reachable clamp panic, immortal-deadline leak,
+  zero-RTO storm); `from_*` saturating constructors; `sendbuf::read`
+  release-mode clamp; `is_none_or` stale-fire guard; `FinWait2` orphan
+  reports `TimedOut` and refreshes on peer activity; `plan_head_rexmit`
+  retransmits SYN while `!syn_acked`; `rcv_adv` right-edge tracking;
+  sender-SWS guard; reasm `emitted` tracks generation; HBH only first /
+  fragmentable-part restriction; quoted-IPv4 checksum unverified;
+  bad-length known TCP option skipped; `next_ident` u64 + zero before
+  entropy; `on_entropy` seed-once; port-0 segments dropped at demux; ABC
+  accumulator reset on RTO; SipHash `expect` fail-closed; SACK degenerate
+  fallback head-rexmit; checksum mixed-AF fail-closed.
+
+### 5.1 addendum
+
+- **L-MTU-1 (datagram-fits-MTU oracle, executed).** The harness asserts
+  every `Action::Transmit{len}` ≤ `config().mtu` on every drain across
+  every suite — a regression of DEF-C5 (or any future option that is not
+  charged against the payload budget) fails immediately.
 
 ---
 

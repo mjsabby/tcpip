@@ -79,6 +79,12 @@ pub fn parse(data: &[u8]) -> Result<(Ipv6Header, &[u8]), WireError> {
     for _ in 0..MAX_EXT_HEADERS {
         match next {
             NEXT_HOP_BY_HOP | NEXT_ROUTING | NEXT_DEST_OPTS => {
+                // RFC 8200 §4.1: Hop-by-Hop, when present, MUST immediately
+                // follow the IPv6 header. Anywhere else is a parser
+                // differential vs. conforming stacks (DEF-L43).
+                if next == NEXT_HOP_BY_HOP && at != HEADER_LEN {
+                    return Err(WireError::BadExtensionHeader);
+                }
                 if at + 4 > end {
                     return Err(WireError::BadExtensionHeader);
                 }
@@ -104,7 +110,7 @@ pub fn parse(data: &[u8]) -> Result<(Ipv6Header, &[u8]), WireError> {
                 let off_flags = read_u16(data, at + 2);
                 frag = Some(FragInfo {
                     ident: read_u32(data, at + 4),
-                    offset: (off_flags & !0x7) >> 3 << 3, // bytes: raw_units*8
+                    offset: off_flags & !0x7, // 13-bit field × 8 = bytes
                     more: off_flags & 0x1 != 0,
                     next: data[at],
                 });
@@ -163,7 +169,12 @@ pub fn walk_payload(mut next: u8, data: &[u8]) -> Result<(u8, &[u8]), WireError>
     let mut at = 0;
     for _ in 0..MAX_EXT_HEADERS {
         match next {
-            NEXT_HOP_BY_HOP | NEXT_ROUTING | NEXT_DEST_OPTS => {
+            // RFC 8200 §4.5: only Destination-Options is permitted in the
+            // fragmentable part. Hop-by-Hop and Routing belong in the
+            // per-fragment (unfragmentable) headers and MUST NOT appear
+            // inside the reassembled payload — accepting them is a parser
+            // differential vs. conforming stacks (DEF-L43).
+            NEXT_DEST_OPTS => {
                 if at + 4 > end {
                     return Err(WireError::BadExtensionHeader);
                 }
@@ -171,14 +182,12 @@ pub fn walk_payload(mut next: u8, data: &[u8]) -> Result<(u8, &[u8]), WireError>
                 if at + ext_len > end {
                     return Err(WireError::BadExtensionHeader);
                 }
-                if next == NEXT_ROUTING && data[at + 3] != 0 {
-                    return Err(WireError::BadExtensionHeader);
-                }
                 next = data[at];
                 at += ext_len;
             }
-            // A fragment header inside a reassembled fragment is invalid.
-            NEXT_FRAGMENT => return Err(WireError::BadExtensionHeader),
+            NEXT_HOP_BY_HOP | NEXT_ROUTING | NEXT_FRAGMENT => {
+                return Err(WireError::BadExtensionHeader);
+            }
             NEXT_NO_NEXT => return Ok((next, &data[end..end])),
             _ => return Ok((next, &data[at..end])),
         }

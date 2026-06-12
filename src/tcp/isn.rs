@@ -33,7 +33,10 @@ impl SipHash24 {
 
         let mut chunks = data.chunks_exact(8);
         for chunk in &mut chunks {
-            let m = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+            // chunks_exact guarantees length 8; fail closed if that
+            // invariant ever breaks (a zero block here would silently
+            // weaken the hash — DEF-L45).
+            let m = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
             v3 ^= m;
             Self::round(&mut v0, &mut v1, &mut v2, &mut v3);
             Self::round(&mut v0, &mut v1, &mut v2, &mut v3);
@@ -95,9 +98,11 @@ impl IsnGenerator {
 
     /// Seed (or re-seed) from runtime-provided entropy.
     pub fn seed(&mut self, bytes: [u8; 16]) {
+        // Fixed-length slices of a `[u8;16]` always succeed; fail closed
+        // rather than silently load a zero key (DEF-L45).
         self.key = Some(SipHash24 {
-            k0: u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8])),
-            k1: u64::from_le_bytes(bytes[8..].try_into().unwrap_or([0; 8])),
+            k0: u64::from_le_bytes(bytes[..8].try_into().expect("len 8")),
+            k1: u64::from_le_bytes(bytes[8..].try_into().expect("len 8")),
         });
     }
 

@@ -152,10 +152,40 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
                 // Entirely outside the window: drop silently (RFC 5961 §3.2).
                 return;
             }
-            if self.state == State::TimeWait && h.flags.fin() {
-                // Retransmitted FIN: restart the 2*MSL wait
-                // (RFC 9293 §3.10.7.4, TIME-WAIT special case).
+            if self.state == State::TimeWait
+                && h.flags.fin()
+                && seq.add(seg_len) == self.rcv_nxt
+            {
+                // The genuine retransmitted FIN — and only it — restarts
+                // the 2·MSL wait (RFC 9293 §3.10.7.4, TIME-WAIT special
+                // case). An *arbitrary* out-of-window FIN must not, or an
+                // off-path attacker who knows the 4-tuple can pin the slot
+                // indefinitely (DEF-M21).
                 self.enter_time_wait(now);
+            }
+            // RFC 9293 §3.10.7.4 step 1: "If the RCV.WND is zero … special
+            // allowance should be made to accept valid ACKs". Without this,
+            // a peer's piggybacked ACK is dropped whenever our receive
+            // buffer is full, and our send side falsely aborts after
+            // `max_data_retries` even though the peer is alive and
+            // acknowledging every retransmit (DEF-M23).
+            if h.flags.ack()
+                && matches!(
+                    self.state,
+                    State::Established
+                        | State::FinWait1
+                        | State::FinWait2
+                        | State::CloseWait
+                        | State::Closing
+                        | State::LastAck
+                )
+                && ack.le(self.snd_nxt)
+                && ack.ge(self.snd_una.sub(self.snd_max_wnd.max(1)))
+            {
+                if self.snd_una.lt(ack) {
+                    self.process_new_ack(now, ack, fx);
+                }
+                self.persist_count = 0;
             }
             // "send an acknowledgment: <SEQ=SND.NXT><ACK=RCV.NXT>"; this is
             // also the reply that answers zero-window probes.
@@ -275,9 +305,9 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             // Only honor a FIN that is inside (or exactly at) the window;
             // one beyond the right edge was trimmed away with its data.
             // Never move an already-recorded FIN backward (an injected
-            // earlier FIN would truncate the legitimate stream).
+            // earlier FIN would truncate the legitimate stream — DEF-H8).
             if (fin_seq == self.rcv_nxt || fin_seq.in_window(self.rcv_nxt, wnd.max(1)))
-                && self.peer_fin.is_none_or(|f| fin_seq.le(f))
+                && self.peer_fin.is_none_or(|f| fin_seq.ge(f))
             {
                 self.peer_fin = Some(fin_seq);
             }
@@ -358,6 +388,15 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             }
             Some(_) => {
                 // SACK recovery: pipe gating in the planner does the work.
+                // DEF-L46: when the scoreboard is degenerate (no holes
+                // above the cursor — e.g. a malicious receiver SACKed
+                // only [una, una+1)), `plan_sack_rexmit` returns None and
+                // recovery would idle until RTO. Fall back to a NewReno-
+                // style head retransmit on the partial ACK so progress is
+                // bounded by RTT, not RTO.
+                if self.scoreboard.next_hole(self.snd_una).is_none() {
+                    self.rexmit_now = true;
+                }
             }
             None => {
                 self.dupacks = 0;
@@ -463,6 +502,15 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             self.rcv_nxt = self.rcv_nxt.add(ins.advance);
             if !was_readable {
                 fx.event(ConnEvent::Readable);
+            }
+            // DEF-L31: the FIN-WAIT-2 orphan timeout guards against a
+            // *silent* peer; a peer that is provably alive (sending data)
+            // refreshes it so a legitimate long half-close receive isn't
+            // truncated.
+            if self.state == State::FinWait2
+                && self.cfg_fin_wait2_timeout > crate::time::Duration::ZERO
+            {
+                self.timers[TimerKind::Wait as usize] = Some(now + self.cfg_fin_wait2_timeout);
             }
             // RFC 1122 §4.2.3.2: an ACK at least every second full-sized
             // segment; otherwise the delayed-ACK timer covers it.

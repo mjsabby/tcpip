@@ -48,25 +48,40 @@ impl SackScoreboard {
     }
 
     /// Merge one validated range; true if it added previously unknown bytes.
-    fn merge(&mut self, mut l: SeqNr, mut r: SeqNr) -> bool {
+    fn merge(&mut self, l: SeqNr, r: SeqNr) -> bool {
         // Quick containment check.
         for &(s, e) in self.ranges.iter() {
             if s.le(l) && r.le(e) {
                 return false;
             }
         }
+        // Bounded state: a disjoint insert into a full board would need
+        // N+1 slots. Drop the *lowest* range (closest to SND.UNA — the
+        // cumulative ACK will cover it soonest) rather than the new one:
+        // the RFC 2018 §4 first block is the most-recent loss signal and
+        // must reach `next_hole`, or recovery is blind to current loss
+        // (DEF-M27). Dropping is never lossy — those bytes remain in
+        // `send_buf` until cumulatively ACKed (R-SACK-4).
+        if self.ranges.len() == MAX_SACK_RANGES
+            && !self
+                .ranges
+                .iter()
+                .any(|&(s, e)| !(e.lt(l) || r.lt(s)))
+        {
+            self.ranges.remove(0);
+        }
         let mut merged: BoundedVec<(SeqNr, SeqNr), MAX_SACK_RANGES> = BoundedVec::new();
+        let (mut l, mut r) = (l, r);
         let mut placed = false;
-        let mut overflow = false;
         for &(s, e) in self.ranges.iter() {
             if e.lt(l) {
-                overflow |= merged.push((s, e)).is_err();
+                let _ = merged.push((s, e));
             } else if r.lt(s) {
                 if !placed {
-                    overflow |= merged.push((l, r)).is_err();
+                    let _ = merged.push((l, r));
                     placed = true;
                 }
-                overflow |= merged.push((s, e)).is_err();
+                let _ = merged.push((s, e));
             } else {
                 // Overlapping or adjacent: absorb.
                 l = l.min(s);
@@ -74,11 +89,7 @@ impl SackScoreboard {
             }
         }
         if !placed {
-            overflow |= merged.push((l, r)).is_err();
-        }
-        if overflow {
-            // Bounded state: ignore the new information rather than grow.
-            return false;
+            let _ = merged.push((l, r));
         }
         self.ranges = merged;
         true
