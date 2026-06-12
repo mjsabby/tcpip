@@ -59,7 +59,12 @@ impl CongestionControl {
     /// A new (cumulative) ACK of `acked` bytes arrived outside recovery.
     pub fn on_new_ack(&mut self, acked: u32) {
         if self.in_slow_start() {
-            // RFC 5681 §3.1: cwnd += min(N, SMSS) per ACK.
+            // RFC 5681 §3.1: cwnd += min(N, SMSS) per ACK. This *is*
+            // ACK-division-safe: splitting one segment's ACK into M
+            // sub-ACKs of N/M bytes each yields M × min(N/M, mss) ≤ N —
+            // growth is bounded by bytes acknowledged, not ACK count.
+            // ABC's L=2 (RFC 3465 §2.2) would only *speed up* stretch
+            // ACKs; the conservative L=1 here is the RFC 5681 default.
             self.cwnd = (self.cwnd + acked.min(self.mss)).min(CWND_MAX);
         } else {
             // Congestion avoidance, RFC 3465 (ABC): accumulate bytes

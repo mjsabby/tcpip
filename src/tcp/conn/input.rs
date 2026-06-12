@@ -304,8 +304,14 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             let fin_seq = seq.add(payload.len() as u32);
             // Only honor a FIN that is inside (or exactly at) the window;
             // one beyond the right edge was trimmed away with its data.
-            // Never move an already-recorded FIN backward (an injected
-            // earlier FIN would truncate the legitimate stream — DEF-H8).
+            // Never move an already-recorded FIN backward: an injected
+            // *earlier* FIN would truncate the legitimate stream (silent
+            // data loss). An injected *later* FIN is accepted and causes
+            // a stall instead (rcv_nxt never reaches it) — for safety-
+            // critical use, a detectable stall (bounded by the peer's
+            // retransmit budget → RST) is preferred to silent corruption
+            // (DEF-H8). Strict `==` would reject both, but also rejects a
+            // legitimate higher FIN after a forged-low arrived first.
             if (fin_seq == self.rcv_nxt || fin_seq.in_window(self.rcv_nxt, wnd.max(1)))
                 && self.peer_fin.is_none_or(|f| fin_seq.ge(f))
             {
