@@ -119,7 +119,11 @@ pub struct Stack<
     const RCV: usize = RECV_BUF_SIZE,
 > {
     reasm: Reassembler,
-    emitted_reasm_timers: [Option<Instant>; REASM_SLOTS],
+    /// `(generation, deadline)` as last told to the runtime, per reasm slot.
+    /// Tracking the generation lets the reconcile address a `CancelTimer`
+    /// to the predecessor occupant when a slot is reallocated under
+    /// backlog (DEF-L42).
+    emitted_reasm_timers: [Option<(u32, Instant)>; REASM_SLOTS],
     core: StackCore<CONNS, SND, RCV>,
 }
 
@@ -142,7 +146,10 @@ struct StackCore<const CONNS: usize, const SND: usize, const RCV: usize> {
     /// RFC 5961 §10 challenge-ACK budget.
     challenge_tokens: u8,
     challenge_refill_at: Instant,
-    ip_ident: u16,
+    /// Monotone counter feeding the keyed-hash IPv4 ID (S-IPID-1). Wide
+    /// enough that the hashed sequence does not repeat within any realistic
+    /// observation window (DEF-L37: u16 had period 65 536).
+    ip_ident: u64,
     next_ephemeral: u16,
     poll_cursor: usize,
     stats: StackStats,
@@ -157,9 +164,21 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             CONNS > 0 && CONNS <= 256,
             "1 ≤ CONNS ≤ 256 (SocketId index is 8 bits)"
         );
+        // Buffer offsets are tracked as u32 throughout (recvbuf/sendbuf/conn);
+        // capacities ≤ 1 GiB keep every `as u32` cast and `off + len` total
+        // (DEF-L23 / OVFL-2).
+        const {
+            assert!(SND > 0 && SND <= (1 << 30), "0 < SND ≤ 1 GiB");
+            assert!(RCV > 0 && RCV <= (1 << 30), "0 < RCV ≤ 1 GiB");
+        }
+        let mut cfg = cfg;
+        // DEF-L23: clamp every config field into its safe range so a
+        // misconfiguration degrades rather than panics, stalls, or leaks.
+        let _clamped = cfg.normalize();
+        debug_assert!(!_clamped, "Config field(s) out of range; clamped");
         assert!(
             !cfg.local_addrs.is_empty(),
-            "stack needs at least one local address"
+            "stack needs at least one unicast local address"
         );
         Stack {
             reasm: Reassembler::new(),
@@ -243,9 +262,14 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
         }
     }
 
-    /// Entropy arrived in answer to [`Action::RequestEntropy`].
+    /// Entropy arrived in answer to [`Action::RequestEntropy`]. Idempotent:
+    /// only the first call seeds the key (RFC 6528 §3 says the secret should
+    /// change only on reboot; a duplicate or accidental re-feed must not
+    /// silently reset it to a known value — DEF-L38).
     pub fn on_entropy(&mut self, bytes: [u8; 16]) {
-        self.core.isn.seed(bytes);
+        if !self.core.isn.ready() {
+            self.core.isn.seed(bytes);
+        }
     }
 
     /// A virtual timer fired.
@@ -254,9 +278,15 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             TimerKey::Conn { sock, kind } => self.core.on_conn_timer(now, sock, kind),
             TimerKey::Reasm { slot, generation } => {
                 let slot = slot as usize;
-                if slot < REASM_SLOTS && self.reasm.generation(slot) == generation {
-                    self.emitted_reasm_timers[slot] = None;
-                    self.reasm.on_timer(slot);
+                if slot < REASM_SLOTS {
+                    // The runtime consumed whatever it had armed for this
+                    // key; reflect that regardless of whether we act on it.
+                    if self.emitted_reasm_timers[slot].is_some_and(|(g, _)| g == generation) {
+                        self.emitted_reasm_timers[slot] = None;
+                    }
+                    if self.reasm.generation(slot) == generation {
+                        self.reasm.on_timer(slot);
+                    }
                 }
             }
         }
@@ -307,16 +337,22 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
             return;
         }
         let src = IpAddr::V6(h.src);
-        if let Some(frag) = h.frag {
-            let key = ReasmKey {
-                src,
-                dst,
-                proto: frag.next,
-                ident: frag.ident,
-            };
-            self.on_fragment(now, key, frag.offset as u32, frag.more, payload);
-        } else {
-            self.core.deliver(now, src, dst, h.proto, payload);
+        match h.frag {
+            // RFC 6946 / RFC 8200 §4.5: an atomic fragment (offset 0, M=0)
+            // is processed as if the Fragment header weren't there — never
+            // routed through reassembly state, so it cannot be denied by an
+            // attacker who has pinned all reassembly slots (DEF-M24).
+            Some(frag) if frag.offset != 0 || frag.more => {
+                let key = ReasmKey {
+                    src,
+                    dst,
+                    proto: frag.next,
+                    ident: frag.ident,
+                };
+                self.on_fragment(now, key, frag.offset as u32, frag.more, payload);
+            }
+            Some(frag) => self.core.deliver(now, src, dst, frag.next, payload),
+            None => self.core.deliver(now, src, dst, h.proto, payload),
         }
     }
 
@@ -392,19 +428,35 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> Stack<CONNS, SND, R
     fn sweep(&mut self, now: Instant) {
         self.core.sweep_conns(now);
         for slot in 0..REASM_SLOTS {
+            let cur_gen = self.reasm.generation(slot);
             let desired = self.reasm.deadline(slot);
             let emitted = self.emitted_reasm_timers[slot];
+            // DEF-L42: a slot reallocated under backlog leaves the
+            // predecessor's timer armed in the runtime under a different
+            // key. Cancel the predecessor before arming the successor.
+            if let Some((old_gen, _)) = emitted
+                && old_gen != cur_gen
+            {
+                let old_key = TimerKey::Reasm {
+                    slot: slot as u8,
+                    generation: old_gen,
+                };
+                if !self.core.queue_action(Action::CancelTimer { key: old_key }) {
+                    continue; // retry next sweep
+                }
+                self.emitted_reasm_timers[slot] = None;
+            }
             let key = TimerKey::Reasm {
                 slot: slot as u8,
-                generation: self.reasm.generation(slot),
+                generation: cur_gen,
             };
-            match (desired, emitted) {
-                (Some(d), e) if e != Some(d) => {
+            match (desired, self.emitted_reasm_timers[slot]) {
+                (Some(d), e) if e.map(|(_, t)| t) != Some(d) => {
                     if self.core.queue_action(Action::StartTimer {
                         key,
                         after: d.saturating_since(now),
                     }) {
-                        self.emitted_reasm_timers[slot] = Some(d);
+                        self.emitted_reasm_timers[slot] = Some((cur_gen, d));
                     }
                 }
                 (None, Some(_)) if self.core.queue_action(Action::CancelTimer { key }) => {
@@ -690,7 +742,17 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
                 ConnEvent::PeerFin => AppEvent::PeerFinReceived { sock },
                 ConnEvent::Closed(reason) => AppEvent::Closed { sock, reason },
             };
-            self.queue_action(Action::App(app));
+            let delivered = self.queue_action(Action::App(app));
+            // DEF-M26: a shed `Connected` is unrecoverable — the app never
+            // receives the SocketId, so "state is the truth" can't help.
+            // Roll `reported` back so the sweep re-emits it, and so a later
+            // close is silent (the app still doesn't know the conn).
+            if !delivered
+                && matches!(ev, ConnEvent::Connected)
+                && let Some(c) = self.conns[idx].as_mut()
+            {
+                c.reported = false;
+            }
         }
     }
 
@@ -750,10 +812,14 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
     /// distinct IDs (the counter is mixed in) so reassembly works.
     fn next_ident(&mut self) -> u16 {
         self.ip_ident = self.ip_ident.wrapping_add(1);
+        // Before entropy is seeded, emit ID 0 rather than the sequential
+        // counter (RFC 6864 permits any value for atomic datagrams). The
+        // sequential fallback exposed an idle-scan side channel during the
+        // boot window via closed-port RSTs and echo replies (DEF-L37).
         self.isn
-            .keyed_hash(domain::IP_IDENT, self.ip_ident as u64)
+            .keyed_hash(domain::IP_IDENT, self.ip_ident)
             .map(|h| h as u16)
-            .unwrap_or(self.ip_ident)
+            .unwrap_or(0)
     }
 
     // ------------------------------------------------------------------
@@ -764,7 +830,10 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
         // S-MARTIAN-1: never reply to a non-unicast source. RFC 1122
         // §4.2.3.10 (MUST silently discard), and prevents reflection toward
         // multicast/broadcast (Smurf-class) and LAND (`src == dst`) loops.
-        if !src.is_unicast_source() || src == dst {
+        // DEF-M25: also reject `src == any local address` — with multiple
+        // local addresses, `src=A, dst=B` defeats the equality check while
+        // still being spoofed-self traffic.
+        if !src.is_unicast_source() || self.cfg.is_local(&src) {
             self.stats.rx_martian_src += 1;
             return;
         }
@@ -772,6 +841,12 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
             self.stats.rx_malformed += 1;
             return;
         };
+        // DEF-L39: port 0 is reserved (RFC 6335 §6); never demux on it and
+        // never accept it as a remote endpoint.
+        if h.src_port == 0 || h.dst_port == 0 {
+            self.stats.rx_malformed += 1;
+            return;
+        }
         let local = SocketAddr::new(dst, h.dst_port);
         let remote = SocketAddr::new(src, h.src_port);
 
@@ -945,18 +1020,19 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
             return;
         }
         if code == icmp::v4::CODE_FRAG_NEEDED {
-            // Path MTU discovery (RFC 1191 / RFC 8201).
+            // Path MTU discovery (RFC 1191 / RFC 8201). Always propagate the
+            // floor-clamped report to *this* connection even when the shared
+            // cache was already at or below it — otherwise a sibling
+            // connection that lowered the cache first leaves this one
+            // blackholed at its stale per-conn MSS (DEF-H9).
             let overhead = if remote.ip.is_v4() {
                 V4_OVERHEAD
             } else {
                 V6_OVERHEAD
             };
-            if let Some(new_pmtu) = self
-                .pmtu
-                .update(now, self.cfg.mtu, &remote.ip, reported_mtu)
-                && let Some(conn) = self.conns[idx].as_mut()
-            {
-                conn.on_pmtu_change(new_pmtu - overhead);
+            let new_pmtu = self.pmtu.update(now, self.cfg.mtu, &remote.ip, reported_mtu);
+            if let Some(conn) = self.conns[idx].as_mut() {
+                conn.on_pmtu_change(now, new_pmtu - overhead);
             }
         } else if code == icmp::v4::CODE_PORT_UNREACHABLE
             || code == icmp::v4::CODE_PROTO_UNREACHABLE
@@ -973,9 +1049,9 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
         if !self.cfg.answer_echo || self.echo.is_some() {
             return; // one pending reply; floods are shed
         }
-        if !src.is_unicast_source() || src == dst {
+        if !src.is_unicast_source() || self.cfg.is_local(&src) {
             self.stats.rx_martian_src += 1;
-            return; // S-MARTIAN-1: never reflect to multicast/broadcast
+            return; // S-MARTIAN-1 / DEF-M25: never reflect to martian/self
         }
         let overhead = if src.is_v4() { 20 + 8 } else { 40 + 8 };
         if payload.len() + overhead > self.cfg.mtu as usize || payload.len() > ECHO_BUF_SIZE {
@@ -1058,7 +1134,21 @@ impl<const CONNS: usize, const SND: usize, const RCV: usize> StackCore<CONNS, SN
                     }
                     continue;
                 }
+                conn.maybe_age_pmtu(now);
                 conn.update_send_timers(now);
+                // DEF-M26: re-emit a previously-shed `Connected` so the app
+                // eventually receives the SocketId.
+                if conn.needs_connected_event() {
+                    let via = conn.accepted_on();
+                    let sock = self.sock_at(idx);
+                    if self.queue_action(Action::App(AppEvent::Connected {
+                        sock,
+                        via_listener: via,
+                    })) && let Some(c) = self.conns[idx].as_mut()
+                    {
+                        c.reported = true;
+                    }
+                }
                 self.reconcile_conn_timers(now, idx);
             }
         }

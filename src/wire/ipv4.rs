@@ -65,10 +65,13 @@ pub fn parse(data: &[u8]) -> Result<(Ipv4Header, &[u8]), WireError> {
 
 /// Parse an IPv4 header from an ICMP error quote, where the quoted datagram
 /// is intentionally truncated (RFC 792: header + first 8 payload bytes).
-/// The header checksum is still verified; `total_len` is not compared with
-/// the buffer. Returns the header and whatever quoted payload is present.
+/// The quoted header checksum is *not* verified: middleboxes commonly mangle
+/// the quote (TTL decrement, NAT rewrite) without recomputing it, and an
+/// off-path forger trivially produces a valid one anyway — verification only
+/// rejects legitimate signals (DEF-L40). The outer ICMP checksum and the
+/// RFC 5927 sequence-number plausibility check remain the authenticators.
 pub fn parse_quote(data: &[u8]) -> Result<(Ipv4Header, &[u8]), WireError> {
-    let header = parse_header(data, true)?;
+    let header = parse_header(data, false)?;
     Ok((header, &data[header.header_len as usize..]))
 }
 

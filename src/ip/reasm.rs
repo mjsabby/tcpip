@@ -41,8 +41,10 @@ struct Slot {
     in_use: bool,
     /// Bumped on every (re)allocation. Carried in `TimerKey::Reasm` so a
     /// stale fire from a previous occupant cannot evict the current one
-    /// under a non-compliant runtime (S-GEN-1).
-    generation: u8,
+    /// under a non-compliant runtime (S-GEN-1). u32 so an attacker cannot
+    /// cycle the slot back to a stale value within the timeout window
+    /// (DEF-M20: u8 wrapped in ~512 packets).
+    generation: u32,
     buf: [u8; REASM_BUF_SIZE],
 }
 
@@ -168,7 +170,10 @@ impl Reassembler {
         if covered == 0 {
             // Entirely within filled space: benign duplicate iff identical.
             if slot.buf[offset as usize..end as usize] == *data {
-                return ReasmResult::Pending;
+                // DEF-M22: a duplicate that is also the final fragment may
+                // have just emptied the hole list above — fall through to
+                // the completion check rather than returning Pending.
+                return Self::finish(slot, slot_idx);
             }
             slot.in_use = false;
             return ReasmResult::Dropped;
@@ -259,7 +264,7 @@ impl Reassembler {
     }
 
     /// Current occupant's generation for `slot` (stale-timer filtering).
-    pub fn generation(&self, slot: usize) -> u8 {
+    pub fn generation(&self, slot: usize) -> u32 {
         self.slots.get(slot).map(|s| s.generation).unwrap_or(0)
     }
 

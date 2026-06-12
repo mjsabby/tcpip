@@ -31,7 +31,7 @@ impl Instant {
     #[inline]
     pub const fn from_millis(millis: u64) -> Self {
         Instant {
-            micros: millis * 1_000,
+            micros: millis.saturating_mul(1_000),
         }
     }
 
@@ -39,7 +39,7 @@ impl Instant {
     #[inline]
     pub const fn from_secs(secs: u64) -> Self {
         Instant {
-            micros: secs * 1_000_000,
+            micros: secs.saturating_mul(1_000_000),
         }
     }
 
@@ -78,7 +78,7 @@ impl Duration {
     #[inline]
     pub const fn from_millis(millis: u64) -> Self {
         Duration {
-            micros: millis * 1_000,
+            micros: millis.saturating_mul(1_000),
         }
     }
 
@@ -86,7 +86,7 @@ impl Duration {
     #[inline]
     pub const fn from_secs(secs: u64) -> Self {
         Duration {
-            micros: secs * 1_000_000,
+            micros: secs.saturating_mul(1_000_000),
         }
     }
 

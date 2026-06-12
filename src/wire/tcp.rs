@@ -171,10 +171,11 @@ fn parse_options(mut opts: &[u8]) -> Result<TcpOptions, WireError> {
                     let _ = out.sack_blocks.push((left, right));
                 }
             }
-            OPT_MSS | OPT_WSCALE | OPT_SACK_PERMITTED | OPT_SACK => {
-                return Err(WireError::BadOption);
-            }
-            _ => {} // unknown option: skipped by length (RFC 1122 §4.2.2.5)
+            // DEF-L41: a known option with a *wrong* length is skipped by
+            // length, not treated as a parse error — middleboxes that
+            // truncate or mis-rewrite options would otherwise blackhole the
+            // whole connection (RFC 1122 §4.2.2.5 "be liberal").
+            _ => {} // unknown / malformed-known option: skipped by length
         }
         opts = &opts[len..];
     }

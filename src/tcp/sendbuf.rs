@@ -75,10 +75,13 @@ impl<const CAP: usize> SendBuffer<CAP> {
     }
 
     /// Read `len` bytes at `off` (relative to SND.UNA) as up to two slices
-    /// (the range may wrap the ring). Caller guarantees the range is stored.
+    /// (the range may wrap the ring). Caller guarantees the range is stored;
+    /// in release the request is clamped so a violated invariant cannot
+    /// silently emit stale ring bytes onto the wire (DEF-L36).
     pub fn read(&self, off: usize, len: usize) -> (&[u8], &[u8]) {
-        debug_assert!(off + len <= self.len);
-        let from = (self.start + off) % CAP;
+        debug_assert!(off.checked_add(len).is_some_and(|e| e <= self.len));
+        let len = len.min(self.len.saturating_sub(off));
+        let from = (self.start + off.min(self.len)) % CAP;
         let first = len.min(CAP - from);
         (&self.buf[from..from + first], &self.buf[..len - first])
     }

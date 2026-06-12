@@ -92,9 +92,18 @@ impl<const CAP: usize> RecvBuffer<CAP> {
     /// i.e. `off == readable` for exactly-in-order data. Caller has already
     /// trimmed `data` to the advertised window, so it always fits the ring.
     pub fn insert(&mut self, off: u32, data: &[u8]) -> Inserted {
-        debug_assert!(off >= self.readable, "caller trims below RCV.NXT");
-        let end = off + data.len() as u32;
-        debug_assert!(end as usize <= CAP, "caller trims to window");
+        // DEF-M28: the sole production caller (`process_text`) maintains
+        // both preconditions, but a violation in release would silently
+        // desync RCV.NXT (see `advance` below) rather than fail closed.
+        // Treat it as the idempotent/clamped case it represents.
+        if off < self.readable {
+            return Inserted {
+                advance: 0,
+                stored: true,
+            };
+        }
+        let end = off.saturating_add(data.len() as u32).min(CAP as u32);
+        let data = &data[..(end - off) as usize];
         if data.is_empty() {
             return Inserted {
                 advance: 0,

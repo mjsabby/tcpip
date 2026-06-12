@@ -141,4 +141,66 @@ impl Config {
     pub fn is_local(&self, addr: &IpAddr) -> bool {
         self.local_addrs.iter().any(|a| a == addr)
     }
+
+    /// Coerce every field into its safe range, returning `true` if any
+    /// field was clamped. Called by `Stack::new` so that a misconfigured
+    /// deployment degrades rather than panics or stalls (DEF-L23 — closes
+    /// the `cfg.mtu < floor` ICMP-triggered abort, immortal-deadline timer
+    /// leaks, and zero-RTO retransmit storms). Local addresses must be
+    /// unicast (a multicast/broadcast `local_addrs` entry would make the
+    /// stack answer group-addressed traffic as if unicast).
+    pub fn normalize(&mut self) -> bool {
+        const DAY: Duration = Duration::from_secs(86_400);
+        let before = Self::snapshot(self);
+        self.local_addrs.retain(|a| a.is_unicast_source());
+        self.mtu = self.mtu.clamp(crate::ip::IPV4_MIN_PMTU, u16::MAX);
+        self.ttl = self.ttl.max(1);
+        self.msl = self.msl.clamp(Duration::from_secs(1), DAY);
+        self.rto_min = self.rto_min.clamp(Duration::from_millis(1), DAY);
+        self.rto_max = self.rto_max.clamp(self.rto_min, DAY);
+        self.rto_initial = self.rto_initial.clamp(self.rto_min, self.rto_max);
+        self.delayed_ack_timeout = self
+            .delayed_ack_timeout
+            .clamp(Duration::from_millis(1), Duration::from_millis(500));
+        self.recv_window_scale = self.recv_window_scale.min(14);
+        if let Some(m) = self.mss_override {
+            self.mss_override = Some(m.max(64));
+        }
+        self.reassembly_timeout = self.reassembly_timeout.clamp(Duration::from_secs(1), DAY);
+        self.fin_wait2_timeout = self.fin_wait2_timeout.min(DAY);
+        before != Self::snapshot(self)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn snapshot(
+        c: &Self,
+    ) -> (
+        usize,
+        u16,
+        u8,
+        Duration,
+        Duration,
+        Duration,
+        Duration,
+        Duration,
+        u8,
+        Option<u16>,
+        Duration,
+        Duration,
+    ) {
+        (
+            c.local_addrs.len(),
+            c.mtu,
+            c.ttl,
+            c.msl,
+            c.rto_initial,
+            c.rto_min,
+            c.rto_max,
+            c.delayed_ack_timeout,
+            c.recv_window_scale,
+            c.mss_override,
+            c.reassembly_timeout,
+            c.fin_wait2_timeout,
+        )
+    }
 }

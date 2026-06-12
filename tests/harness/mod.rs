@@ -305,6 +305,15 @@ impl Net {
                     self.stack(host).on_entropy(seed);
                 }
                 Action::Transmit { len } => {
+                    // L-MTU-1 oracle: no emitted IP datagram may exceed the
+                    // configured MTU. This is the standing regression for
+                    // DEF-C5 (SACK options not charged against eff_send_mss
+                    // → MTU+36 datagrams → tx-buffer panic / DF blackhole).
+                    let mtu = self.stack(host).config().mtu as usize;
+                    assert!(
+                        len <= mtu,
+                        "L-MTU-1: stack emitted {len}-byte datagram > MTU {mtu}"
+                    );
                     self.launch(host, &tx[..len]);
                 }
                 Action::StartTimer { key, after } => {

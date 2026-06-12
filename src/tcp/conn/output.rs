@@ -142,13 +142,19 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     /// Retransmit the earliest unacknowledged segment (RTO, fast
     /// retransmit, NewReno partial ACK, or PMTU shrink).
     fn plan_head_rexmit(&mut self, now: Instant) -> Option<SegmentPlan> {
-        if self.state == State::SynReceived {
-            // Head retransmission in SYN-RECEIVED is the SYN-ACK itself.
+        // While the SYN is unacknowledged the head segment *is* the SYN /
+        // SYN-ACK regardless of state — close() may have moved us out of
+        // SYN-RECEIVED before the SYN-ACK was acknowledged (DEF-L32).
+        if !self.syn_acked {
             self.syn_pending = true;
-            return self.plan_syn(now, true);
+            return self.plan_syn(now, self.state != State::SynSent);
         }
         let data_avail = self.data_sent();
-        let len = data_avail.min(self.eff_send_mss() as u32);
+        // DEF-C5: charge SACK option bytes against the MSS budget so the IP
+        // datagram never exceeds PMTU (RFC 6691).
+        let sack_blocks = self.recv_sack_blocks();
+        let mss = (self.eff_send_mss() as u32).saturating_sub(Self::sack_opt_len(&sack_blocks));
+        let len = data_avail.min(mss.max(1));
         let fin_here = match self.fin_seq {
             Some(f) => f == self.snd_una.add(len) && f.lt(self.snd_nxt),
             None => false,
@@ -183,7 +189,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             payload_off: 0,
             payload_len: len,
             syn_opts: None,
-            sack_blocks: self.recv_sack_blocks(),
+            sack_blocks,
         })
     }
 
@@ -205,12 +211,15 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         // The hole may include our FIN's sequence slot; data lives below
         // `data_end`.
         let data_end = self.snd_una.add(self.data_sent());
+        // DEF-C5: charge SACK option bytes against the MSS budget.
+        let sack_blocks = self.recv_sack_blocks();
+        let mss = (self.eff_send_mss() as u32).saturating_sub(Self::sack_opt_len(&sack_blocks));
         let mut flags = TcpFlags::default();
         let (len, fin_here) = if start.ge(data_end) {
             (0, self.fin_seq.is_some())
         } else {
             let avail = data_end.since(start);
-            (hole_len.min(avail).min(self.eff_send_mss() as u32), false)
+            (hole_len.min(avail).min(mss.max(1)), false)
         };
         if len == 0 && !fin_here {
             return None;
@@ -235,7 +244,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             payload_off: start.since(self.snd_una),
             payload_len: len,
             syn_opts: None,
-            sack_blocks: self.recv_sack_blocks(),
+            sack_blocks,
         })
     }
 
@@ -249,9 +258,15 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
     /// segmentized, then form a FIN segment"). Omitting LAST-ACK here strands
     /// any send-buffer bytes not yet transmitted when CLOSE-WAIT→LAST-ACK.
     fn plan_data(&mut self, now: Instant) -> Option<SegmentPlan> {
+        // DEF-H7: include CLOSING — a simultaneous close that races queued
+        // data must still drain it (RFC 9293 §3.10.4).
         if !matches!(
             self.state,
-            State::Established | State::CloseWait | State::FinWait1 | State::LastAck
+            State::Established
+                | State::CloseWait
+                | State::FinWait1
+                | State::Closing
+                | State::LastAck
         ) {
             return None;
         }
@@ -267,13 +282,31 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         if usable == 0 {
             return None; // zero window → persist machinery takes over
         }
-        let mss = self.eff_send_mss() as u32;
-        let len = unsent.min(usable).min(mss);
+        // DEF-C5: charge SACK option bytes against the MSS budget so the IP
+        // datagram never exceeds PMTU (RFC 6691).
+        let sack_blocks = self.recv_sack_blocks();
+        let mss = (self.eff_send_mss() as u32).saturating_sub(Self::sack_opt_len(&sack_blocks));
+        let len = unsent.min(usable).min(mss.max(1));
         // Nagle (RFC 9293 §3.7.4): hold small segments while data is in
         // flight — unless this small segment finishes the stream (FIN rides
         // along) or Nagle is disabled.
         let finishes_stream = self.fin_queued && len == unsent;
         if self.cfg_nagle && len < mss && self.bytes_in_flight() > 0 && !finishes_stream {
+            return None;
+        }
+        // Sender-side SWS avoidance (RFC 9293 §3.8.6.2.1): independently of
+        // Nagle, do not send a tiny segment into a tiny *peer* window unless
+        // it empties our buffer — a peer that drip-feeds 1-byte windows
+        // would otherwise elicit 1-byte segments at 40× header overhead.
+        // Hold only while data is in flight (an ACK is en route to widen
+        // the usable window); when idle, send what fits so the persist
+        // mechanism — not silence — covers the small-window case
+        // (RFC 9293 condition (4) "override timeout", DEF-L47).
+        if len < mss
+            && len < self.snd_max_wnd / 2
+            && len < unsent
+            && self.bytes_in_flight() > 0
+        {
             return None;
         }
         let payload_off = self.data_sent();
@@ -302,7 +335,7 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             payload_off,
             payload_len: len,
             syn_opts: None,
-            sack_blocks: self.recv_sack_blocks(),
+            sack_blocks,
         })
     }
 
@@ -311,7 +344,8 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
         if !self.fin_queued || self.fin_seq.is_some() || self.unsent() != 0 {
             return None;
         }
-        if !matches!(self.state, State::FinWait1 | State::LastAck) {
+        // DEF-H7: include CLOSING — peer's FIN may arrive before ours leaves.
+        if !matches!(self.state, State::FinWait1 | State::Closing | State::LastAck) {
             return None;
         }
         self.fin_seq = Some(self.snd_nxt);
@@ -391,10 +425,17 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
 
     /// Window to advertise (RFC 7323 §2.3: shifted right by our scale).
     fn advertise_window(&mut self) -> u16 {
-        let w = self.recv_buf.window();
+        // DEF-L35: never let the right edge `RCV.NXT + RCV.WND` retreat
+        // (RFC 9293 §3.8.6.2.1 SHOULD-NOT). Scale truncation alone can
+        // shrink it by up to `2^scale − 1` bytes per ACK; track the last
+        // advertised right edge and floor the window at the distance to it.
+        let buf_wnd = self.recv_buf.window();
+        let edge_wnd = self.rcv_adv.since(self.rcv_nxt).min(buf_wnd);
+        let w = buf_wnd.max(edge_wnd);
         let field = (w >> self.rcv_scale).min(u16::MAX as u32) as u16;
-        // Track what the peer will perceive, for the SWS update heuristic.
+        // Track what the peer will perceive, for SWS and the next call.
         self.last_wnd_advertised = (field as u32) << self.rcv_scale;
+        self.rcv_adv = self.rcv_nxt.add(self.last_wnd_advertised);
         field
     }
 
@@ -409,6 +450,18 @@ impl<const SND: usize, const RCV: usize> Connection<SND, RCV> {
             }
         }
         out
+    }
+
+    /// Bytes of TCP-option area `blocks` will occupy on the wire, including
+    /// alignment NOPs (used to charge against `eff_send_mss` per RFC 6691 /
+    /// RFC 9293 §3.7.1: the segment must fit in PMTU *with* its options).
+    fn sack_opt_len(blocks: &BoundedVec<(u32, u32), 4>) -> u32 {
+        if blocks.is_empty() {
+            0
+        } else {
+            // 2× NOP + kind + len + 8 per block, padded to 4 (already aligned).
+            4 + 8 * blocks.len() as u32
+        }
     }
 
     /// Every emitted segment in a synchronized state carries an ACK: clear

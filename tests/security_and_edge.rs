@@ -304,18 +304,19 @@ fn fragmented_ip_datagram_reassembles_into_a_segment() {
 fn time_wait_absorbs_late_duplicate_and_expires() {
     let mut net = clean();
     let (client, server) = establish(&mut net, PORT);
+    // Close both ends before draining so the harness doesn't advance the
+    // clock all the way to A's FIN-WAIT-2 orphan timer between closes
+    // (which would close A from FW2 — exactly what DEF-L33 now flags as
+    // `TimedOut` — and never reach TIME-WAIT at all).
     net.close(Host::A, client);
-    net.run(200);
     net.close(Host::B, server);
-    net.run(200);
-    // Client is in TIME-WAIT (active closer). Confirm it is still present
-    // before 2*MSL.
+    while net.state_a(client) != Some(TcpState::TimeWait) {
+        assert!(net.step(), "reached quiescence before TIME-WAIT");
+    }
     net.idle(Duration::from_secs(10));
-    assert!(
-        matches!(net.state_a(client), Some(TcpState::TimeWait) | None),
-        "client in TIME-WAIT or already done"
-    );
-    // After 2*MSL (default MSL 30s → 60s) it is reclaimed.
+    // Still in TIME-WAIT before 2·MSL.
+    assert_eq!(net.state_a(client), Some(TcpState::TimeWait));
+    // After 2*MSL (default MSL 30s → 60s) it is reclaimed gracefully.
     net.idle(Duration::from_secs(130));
     assert_eq!(net.state_a(client), None);
     assert_eq!(
@@ -393,6 +394,106 @@ fn challenge_ack_budget_is_jittered_per_second() {
     assert!(
         !counts.windows(2).all(|w| w[0] == w[1]),
         "challenge-ACK budget is constant across seconds — CVE-2016-5696 side channel: {counts:?}"
+    );
+}
+
+/// DEF-C5: a full-MSS data segment carrying SACK blocks must still fit the
+/// path MTU. Before the fix `eff_send_mss` ignored the option overhead, so
+/// a single out-of-order segment from the peer caused the next emitted
+/// data segment to be `MTU + 36` bytes — overrunning the runtime's tx
+/// buffer (panic) or, with DF set, blackholing at the bottleneck.
+#[test]
+fn full_mss_segment_with_sack_blocks_fits_mtu() {
+    let mut net = clean();
+    let (client, server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let snd_una = net.a_snd_una(client);
+
+    // Give A four disjoint out-of-order ranges so it has the maximum SACK
+    // option payload to attach (4 blocks = 36 option bytes).
+    let now = net.now();
+    for i in 0..4u32 {
+        let seq = rcv_nxt.wrapping_add(100 + i * 8);
+        let seg = forge_v4(b, a, seq, snd_una, TcpFlags::ACK, 16384, &[0x11; 4]);
+        net.a.on_datagram(now, &seg);
+    }
+    net.pump_public();
+
+    // A now sends a full window of data; every emitted IP datagram must be
+    // ≤ MTU even with 36 bytes of SACK options riding on top of payload.
+    // Drive the stack directly so we can inspect each Transmit length.
+    let mtu = 1500usize;
+    let payload = vec![0x77u8; 8 * mtu];
+    let n = net.a.send(client, &payload).expect("send");
+    assert!(n > 0);
+    let now = net.now();
+    let mut tx = [0u8; harness::FRAME];
+    let mut saw_full = false;
+    while let Some(act) = net.a.poll_action(now, &mut tx) {
+        if let tcp_sans_io::Action::Transmit { len } = act {
+            assert!(
+                len <= mtu,
+                "DEF-C5: emitted datagram {len} > MTU {mtu} (SACK option \
+                 overhead not charged against eff_send_mss)"
+            );
+            // We want to see at least one segment that *would* have been
+            // full-MSS (i.e., the payload-sizing path was exercised, not
+            // just a tail fragment).
+            saw_full |= len > mtu - 100;
+        }
+    }
+    assert!(saw_full, "expected at least one near-MSS data segment");
+    let _ = server;
+}
+
+/// DEF-H8: an injected FIN at an *earlier* in-window sequence must not
+/// overwrite a later, legitimately-recorded peer FIN — that would truncate
+/// the application stream at the injected position.
+#[test]
+fn injected_earlier_fin_does_not_truncate_stream() {
+    let mut net = clean();
+    let (client, _server) = establish(&mut net, PORT);
+    let a = net.endpoint(Host::A, net.client_port(client));
+    let b = net.endpoint(Host::B, PORT);
+    let rcv_nxt = net.a_rcv_nxt(client);
+    let snd_una = net.a_snd_una(client);
+    let now = net.now();
+
+    // Legitimate peer's FIN sits 200 bytes into the future (out of order).
+    let real_fin = forge_v4(
+        b,
+        a,
+        rcv_nxt.wrapping_add(200),
+        snd_una,
+        TcpFlags::ACK.union(TcpFlags::FIN),
+        16384,
+        &[],
+    );
+    net.a.on_datagram(now, &real_fin);
+    // Attacker injects an *earlier* FIN at +50.
+    let forged_fin = forge_v4(
+        b,
+        a,
+        rcv_nxt.wrapping_add(50),
+        snd_una,
+        TcpFlags::ACK.union(TcpFlags::FIN),
+        16384,
+        &[],
+    );
+    net.a.on_datagram(now, &forged_fin);
+    // Now the peer's real bytes 0..200 arrive in order.
+    let body = forge_v4(b, a, rcv_nxt, snd_una, TcpFlags::ACK, 16384, &[0x42; 200]);
+    net.a.on_datagram(now, &body);
+    net.pump_public();
+
+    // All 200 bytes must be readable; the FIN is consumed at 200, not 50.
+    let got = net.recv_all(Host::A, client);
+    assert_eq!(
+        got.len(),
+        200,
+        "DEF-H8: forged earlier FIN truncated the stream"
     );
 }
 

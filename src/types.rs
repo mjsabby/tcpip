@@ -59,6 +59,14 @@ impl IpAddr {
                     && *b != [255, 255, 255, 255] // limited broadcast
             }
             IpAddr::V6(b) => {
+                // DEF-M16: IPv4-mapped (::ffff:0:0/96) and IPv4-compatible
+                // (::/96) addresses must be judged by the embedded IPv4
+                // address — `::ffff:224.0.0.1` is multicast, not unicast.
+                // RFC 4291 says these SHOULD NOT appear on the wire; reject
+                // the embedded martians and admit the rest.
+                if b[..10] == [0; 10] && (b[10..12] == [0xff, 0xff] || b[10..12] == [0, 0]) {
+                    return IpAddr::V4([b[12], b[13], b[14], b[15]]).is_unicast_source();
+                }
                 *b != [0; 16]                 // ::
                     && b[0] != 0xff           // ff00::/8 multicast
                     && !(b[0] == 0 && b[15] == 1 && b[1..15] == [0; 14]) // ::1
@@ -135,8 +143,10 @@ pub enum TimerKey {
         slot: u8,
         /// Slot generation. Like [`SocketId::generation`], this lets the
         /// stack detect a stale fire for a recycled slot instead of evicting
-        /// the wrong datagram (S-GEN-1).
-        generation: u8,
+        /// the wrong datagram (S-GEN-1). Wide enough that an attacker cannot
+        /// realistically cycle one slot back to a stale value within the
+        /// reassembly timeout (DEF-M20: u8 wrapped in ~512 packets).
+        generation: u32,
     },
 }
 
@@ -145,7 +155,7 @@ pub enum TimerKey {
 /// API calls ([`crate::Stack::connect`], `send`, `recv`, `close`, …) are the
 /// remaining inputs; a replaying runtime records those calls alongside these
 /// events to reproduce a run exactly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum Event<'a> {
     /// A whole IP datagram arrived from the link-layer adapter.
     DatagramReceived(&'a [u8]),
@@ -153,6 +163,18 @@ pub enum Event<'a> {
     TimerExpired(TimerKey),
     /// Entropy supplied in response to [`Action::RequestEntropy`].
     EntropyProvided([u8; 16]),
+}
+
+impl core::fmt::Debug for Event<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Event::DatagramReceived(d) => write!(f, "DatagramReceived({} bytes)", d.len()),
+            Event::TimerExpired(k) => write!(f, "TimerExpired({k:?})"),
+            // DEF-M17 / S-ISN-DEBUG: this *is* the ISN/port/IP-ID secret. A
+            // derived Debug would print all 16 bytes into any replay log.
+            Event::EntropyProvided(_) => f.write_str("EntropyProvided(<redacted>)"),
+        }
+    }
 }
 
 /// Notifications to the application embedded in the action stream.
@@ -323,5 +345,19 @@ mod tests {
         assert!(!IpAddr::v6([0; 8]).is_unicast_source()); // ::
         assert!(!IpAddr::v6([0, 0, 0, 0, 0, 0, 0, 1]).is_unicast_source()); // ::1
         assert!(!IpAddr::v6([0xff02, 0, 0, 0, 0, 0, 0, 1]).is_unicast_source()); // multicast
+        // DEF-M16: IPv4-mapped IPv6 is judged by the embedded v4 address.
+        assert!(!IpAddr::v6([0, 0, 0, 0, 0, 0xffff, 0xe000, 0x0001]).is_unicast_source()); // ::ffff:224.0.0.1
+        assert!(!IpAddr::v6([0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001]).is_unicast_source()); // ::ffff:127.0.0.1
+        assert!(!IpAddr::v6([0, 0, 0, 0, 0, 0xffff, 0xffff, 0xffff]).is_unicast_source()); // ::ffff:255.255.255.255
+        assert!(IpAddr::v6([0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001]).is_unicast_source()); // ::ffff:10.0.0.1
+    }
+
+    #[test]
+    fn entropy_event_debug_is_redacted() {
+        // DEF-M17 / S-ISN-DEBUG: the seed must never end up in a replay log.
+        extern crate std;
+        let s = std::format!("{:?}", Event::EntropyProvided([0xab; 16]));
+        assert!(!s.contains("ab"), "seed bytes leaked into Debug: {s}");
+        assert!(s.contains("redacted"));
     }
 }
